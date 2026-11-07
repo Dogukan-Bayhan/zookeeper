@@ -12,8 +12,7 @@ package server
 import (
 	"errors"
 	"fmt"
-	"io"
-	"log"
+	"log/slog"
 	"sort"
 	"sync"
 	"sync/atomic"
@@ -21,6 +20,7 @@ import (
 
 	"zookeeper/transport"
 	"zookeeper/zk"
+	"zookeeper/zlog"
 )
 
 // Config configures a server.
@@ -49,8 +49,9 @@ type Config struct {
 	// Session timeout bounds (defaults 2 ticks and 60s).
 	MinSessionTimeout time.Duration
 	MaxSessionTimeout time.Duration
-	// Logger receives debug output; nil disables logging.
-	Logger *log.Logger
+	// Logger receives structured logs of every step (election, Zab phases,
+	// proposals, commits, sessions, watches); nil disables logging.
+	Logger *slog.Logger
 }
 
 // Server is one member of a ZooKeeper ensemble.
@@ -104,6 +105,7 @@ type Server struct {
 	peerOut map[int64]*peerSender
 
 	serving atomic.Bool
+	lg      *slog.Logger
 }
 
 // ErrNotServing is returned when a write cannot be routed to a leader.
@@ -138,9 +140,7 @@ func New(cfg Config) (*Server, error) {
 	if cfg.MaxSessionTimeout <= 0 {
 		cfg.MaxSessionTimeout = 60 * time.Second
 	}
-	if cfg.Logger == nil {
-		cfg.Logger = log.New(io.Discard, "", 0)
-	}
+	cfg.Logger = zlog.OrDiscard(cfg.Logger)
 	s := &Server{
 		cfg:        cfg,
 		id:         cfg.ID,
@@ -155,9 +155,15 @@ func New(cfg Config) (*Server, error) {
 		peerOut:    map[int64]*peerSender{},
 	}
 	s.cond = sync.NewCond(&s.mu)
+	s.lg = cfg.Logger.With("comp", fmt.Sprintf("server-%d", cfg.ID))
+	s.watches.lg = s.lg
 	if err := s.recover(); err != nil {
 		return nil, err
 	}
+	s.lg.Info("recovered state from storage",
+		"snapshotZxid", zlog.ZxidString(s.lastCommitted), "logEntries", len(s.log),
+		"lastLogged", zlog.ZxidString(s.lastLogged), "acceptedEpoch", s.acceptedEpoch,
+		"currentEpoch", s.currentEpoch, "znodes", s.tree.NodeCount(), "sessions", len(s.tree.sessions))
 	return s, nil
 }
 
@@ -200,6 +206,8 @@ func (s *Server) Start() error {
 	s.wg.Add(2)
 	go s.acceptLoop()
 	go s.run()
+	s.lg.Info("★ server started", "addr", s.cfg.Peers[s.id], "ensemble", len(s.cfg.Peers),
+		"quorum", s.quorum, "tick", s.cfg.TickTime)
 	return nil
 }
 
@@ -215,6 +223,7 @@ func (s *Server) Close() error {
 	s.state = Stopped
 	s.cond.Broadcast()
 	s.mu.Unlock()
+	s.lg.Warn("server shutting down")
 	close(s.quit)
 	s.serving.Store(false)
 	if s.ln != nil {
@@ -228,10 +237,6 @@ func (s *Server) Close() error {
 	s.closeAllClients()
 	s.wg.Wait()
 	return nil
-}
-
-func (s *Server) logf(format string, args ...any) {
-	s.cfg.Logger.Printf("[server %d] "+format, append([]any{s.id}, args...)...)
 }
 
 func (s *Server) trackConn(c transport.Conn) bool {
@@ -315,6 +320,7 @@ func (s *Server) run() {
 		}
 		s.state = Looking
 		s.mu.Unlock()
+		s.lg.Info("★ state LOOKING: searching for a leader", "lastLogged", zlog.ZxidString(s.lastLogged))
 
 		leader, ok := s.lookForLeader()
 		if !ok {
@@ -332,7 +338,7 @@ func (s *Server) run() {
 			s.state = Following
 		}
 		s.mu.Unlock()
-		s.logf("elected leader %d", leader)
+		s.lg.Info("★ leader elected", "leader", leader, "role", s.State())
 		if leader == s.id {
 			s.lead()
 		} else {
@@ -363,11 +369,14 @@ func (s *Server) acceptLoop() {
 			}
 			switch m := first.(type) {
 			case *ElectionHello:
+				s.trace("election connection from peer", "peer", m.From)
 				s.readElection(c)
 			case *FollowerInfo:
 				s.serveLearner(c, m)
 			case *zk.ConnectRequest:
 				s.handleClient(c, m)
+			default:
+				s.lg.Warn("unexpected first message on connection", "type", fmt.Sprintf("%T", first))
 			}
 		}()
 	}
@@ -448,6 +457,7 @@ func (s *Server) applyCommitted(z int64) {
 // applyTxn applies a committed transaction to the database, fires watches
 // and answers the client if the request was received by this server.
 func (s *Server) applyTxn(txn *Txn) {
+	s.logApply(txn)
 	s.dbMu.Lock()
 	res := s.tree.Apply(txn)
 	for _, t := range res.triggers {
@@ -494,6 +504,9 @@ func (s *Server) applyTxn(txn *Txn) {
 		}
 	}
 
+	if txn.Type == TxnCloseSession && s.leader != nil {
+		s.lg.Info("session closed", zlog.Session(txn.SessionID), "ephemeralsDeleted", len(txn.Deletes))
+	}
 	s.txnsSinceSnap++
 	if s.cfg.SnapCount > 0 && s.txnsSinceSnap >= s.cfg.SnapCount && !s.snapRunning {
 		s.txnsSinceSnap = 0
@@ -519,7 +532,7 @@ func (s *Server) takeSnapshot(gen int64) {
 		return // state was replaced by a SNAP from the leader meanwhile
 	}
 	if err := s.cfg.Storage.SaveSnapshot(snap); err != nil {
-		s.logf("snapshot failed: %v", err)
+		s.lg.Error("saving snapshot failed", zlog.Err(err))
 		return
 	}
 	// Keep one snapshot interval of log so lagging followers can still be
@@ -531,7 +544,8 @@ func (s *Server) takeSnapshot(gen int64) {
 		}
 	}
 	s.prevSnapZxid = snap.Zxid
-	s.logf("snapshot at zxid %x (%d nodes)", snap.Zxid, len(snap.Nodes))
+	s.lg.Info("★ fuzzy snapshot written", "zxid", zlog.ZxidString(snap.Zxid), "znodes", len(snap.Nodes),
+		"sessions", len(snap.Sessions), "logEntriesKept", len(s.log))
 }
 
 func (s *Server) fuzzySnapshot() *Snapshot {
@@ -562,6 +576,8 @@ func (s *Server) fuzzySnapshot() *Snapshot {
 // installSnapshot replaces the local state with the leader's (SNAP sync).
 func (s *Server) installSnapshot(snap *Snapshot, entries []*Txn) error {
 	s.snapGen++
+	s.lg.Info("installing snapshot from leader (SNAP)", "zxid", zlog.ZxidString(snap.Zxid),
+		"znodes", len(snap.Nodes), "inflight", len(entries))
 	if err := s.cfg.Storage.SaveSnapshot(snap); err != nil {
 		return err
 	}

@@ -7,6 +7,7 @@ import (
 
 	"zookeeper/transport"
 	"zookeeper/zk"
+	"zookeeper/zlog"
 )
 
 // clientSession is a session connected to this server. Requests of a session
@@ -60,6 +61,7 @@ func (cs *clientSession) submit(r *zk.Request) {
 	}
 	if err != nil {
 		// We lost the leader; the client will reconnect elsewhere.
+		cs.srv.lg.Warn("cannot route write to a leader, dropping client connection", zlog.Session(cs.id))
 		cs.conn.Close()
 	}
 }
@@ -117,6 +119,10 @@ func (s *Server) execRead(cs *clientSession, r *zk.Request) {
 	s.dbMu.RLock()
 	defer s.dbMu.RUnlock()
 	resp.Zxid = s.tree.lastZxid
+	defer func() {
+		s.lg.Debug("read served from local replica", zlog.Session(cs.id), "op", r.Op.String(), "path", r.Path,
+			"watch", r.Watch, "result", resp.Err.Err(), zlog.Zxid(resp.Zxid))
+	}()
 	switch r.Op {
 	case zk.OpExists:
 		st, ok := s.tree.Stat(r.Path)
@@ -170,6 +176,7 @@ func (s *Server) newSessionID() int64 {
 func (s *Server) handleClient(conn transport.Conn, req *zk.ConnectRequest) {
 	defer conn.Close()
 	if !s.serving.Load() {
+		s.lg.Info("refusing client: server is not serving (no established leader)")
 		conn.Send(&zk.ConnectResponse{Err: zk.CodeNotReady})
 		return
 	}
@@ -208,6 +215,7 @@ func (s *Server) handleClient(conn transport.Conn, req *zk.ConnectRequest) {
 		old := s.registerSession(cs)
 		conn.Send(&zk.ConnectResponse{SessionID: id, Timeout: timeout, Zxid: s.tree.lastZxid})
 		s.dbMu.RUnlock()
+		s.lg.Info("★ new session established", zlog.Session(id), "timeout", time.Duration(timeout)*time.Millisecond)
 		if old != nil {
 			old.close()
 		}
@@ -217,11 +225,14 @@ func (s *Server) handleClient(conn transport.Conn, req *zk.ConnectRequest) {
 			// This server has not yet seen state the client has seen: refuse
 			// so the client picks a more recent server (Section 4.4).
 			s.dbMu.RUnlock()
+			s.lg.Info("refusing session: client has seen newer state than this server", zlog.Session(req.SessionID),
+				"clientZxid", zlog.ZxidString(req.LastZxid), "serverZxid", zlog.ZxidString(s.LastZxid()))
 			conn.Send(&zk.ConnectResponse{Err: zk.CodeServerBehind})
 			return
 		}
 		if !s.tree.HasSession(req.SessionID) {
 			s.dbMu.RUnlock()
+			s.lg.Info("refusing session: it has expired", zlog.Session(req.SessionID))
 			conn.Send(&zk.ConnectResponse{Err: zk.CodeSessionExpired})
 			return
 		}
@@ -230,6 +241,8 @@ func (s *Server) handleClient(conn transport.Conn, req *zk.ConnectRequest) {
 		conn.Send(&zk.ConnectResponse{SessionID: cs.id, Timeout: timeout, Zxid: s.tree.lastZxid})
 		s.rewatch(cs, req)
 		s.dbMu.RUnlock()
+		s.lg.Info("★ session moved to this server", zlog.Session(cs.id), "clientZxid", zlog.ZxidString(req.LastZxid),
+			"watches", len(req.DataWatches)+len(req.ExistWatches)+len(req.ChildWatches))
 		if old != nil {
 			old.close()
 		}
@@ -246,11 +259,17 @@ func (s *Server) handleClient(conn transport.Conn, req *zk.ConnectRequest) {
 		}
 		s.touch(cs.id)
 		if r.Op == zk.OpPing {
+			s.trace("client heartbeat", zlog.Session(cs.id))
 			conn.Send(&zk.Response{Xid: zk.PingXid, Zxid: s.LastZxid()})
 			continue
 		}
+		if r.Op.IsWrite() || r.Op == zk.OpSync {
+			s.lg.Debug("client write received, forwarding to leader", zlog.Session(cs.id), "op", r.Op.String(),
+				"path", r.Path, "xid", r.Xid)
+		}
 		cs.submit(r)
 	}
+	s.lg.Info("client connection closed", zlog.Session(cs.id))
 	cs.close()
 	s.unregisterSession(cs)
 }
@@ -261,6 +280,8 @@ func (s *Server) handleClient(conn transport.Conn, req *zk.ConnectRequest) {
 func (s *Server) rewatch(cs *clientSession, req *zk.ConnectRequest) {
 	rel, zxid := req.LastZxid, s.tree.lastZxid
 	fire := func(t zk.EventType, p string) {
+		s.lg.Debug("re-registered watch fired immediately (changed while client was moving)",
+			zlog.Session(cs.id), "event", t.String(), "path", p)
 		cs.send(&zk.WatcherEvent{Type: t, Path: p, Zxid: zxid})
 	}
 	for _, p := range req.DataWatches {

@@ -1,10 +1,12 @@
 package server
 
 import (
+	"fmt"
 	"time"
 
 	"zookeeper/transport"
 	"zookeeper/zk"
+	"zookeeper/zlog"
 )
 
 // leaderState is the state of a server while it leads the ensemble. All
@@ -71,7 +73,7 @@ func newLeaderState(s *Server) *leaderState {
 
 func (s *Server) saveEpochs() {
 	if err := s.cfg.Storage.SaveEpochs(s.acceptedEpoch, s.currentEpoch); err != nil {
-		s.logf("saving epochs: %v", err)
+		s.lg.Error("saving epochs failed", zlog.Err(err))
 	}
 }
 
@@ -101,11 +103,12 @@ func (s *Server) establish(ls *leaderState) bool {
 	ls.infos[s.id] = s.acceptedEpoch
 	ls.ackEpochs[s.id] = true
 	ls.newLeaderAcks[s.id] = true
+	s.lg.Info("★ LEADING: phase 1 (discovery) waiting for a quorum of followers", "quorum", s.quorum)
 
 	// Discovery: a quorum of followers tells us their accepted epochs; the
 	// new epoch is larger than any of them.
 	if !s.waitCond(s.initTimeout(), func() bool { return len(ls.infos) >= s.quorum }) {
-		s.logf("leader: not enough followers")
+		s.lg.Warn("not enough followers connected in time, giving up leadership", "connected", len(ls.infos))
 		return false
 	}
 	var maxEpoch int64
@@ -117,20 +120,23 @@ func (s *Server) establish(ls *leaderState) bool {
 	s.saveEpochs()
 	ls.epochDecided = true
 	s.cond.Broadcast()
+	s.lg.Info("new epoch proposed to followers", "epoch", ls.epoch, "followers", len(ls.infos)-1)
 
 	if !s.waitCond(s.initTimeout(), func() bool { return ls.abandon || len(ls.ackEpochs) >= s.quorum }) || ls.abandon {
-		s.logf("leader: discovery failed")
+		s.lg.Warn("discovery failed (a follower is ahead or not enough acks)", "abandon", ls.abandon)
 		return false
 	}
 
 	// Our history is the most recent of the quorum: commit all of it before
 	// synchronizing followers.
+	s.lg.Info("phase 2 (synchronization): committing own history", "upTo", zlog.ZxidString(s.lastLogged),
+		"from", zlog.ZxidString(s.lastCommitted))
 	s.applyCommitted(s.lastLogged)
 	ls.historyCommitted = true
 	s.cond.Broadcast()
 
 	if !s.waitCond(s.initTimeout(), func() bool { return len(ls.newLeaderAcks) >= s.quorum }) {
-		s.logf("leader: synchronization failed")
+		s.lg.Warn("synchronization failed: no quorum acknowledged NEWLEADER")
 		return false
 	}
 	s.currentEpoch = ls.epoch
@@ -144,7 +150,12 @@ func (s *Server) establish(ls *leaderState) bool {
 	}
 	s.serving.Store(true)
 	s.cond.Broadcast()
-	s.logf("leading epoch %d with %d followers", ls.epoch, len(ls.forwarding))
+	var followers []int64
+	for id := range ls.forwarding {
+		followers = append(followers, id)
+	}
+	s.lg.Info("★ phase 3 (broadcast): ensemble established, serving clients", "epoch", ls.epoch,
+		"followers", fmt.Sprint(followers), "sessions", len(ls.tracker))
 	return true
 }
 
@@ -161,7 +172,7 @@ func (s *Server) leaderLoop(ls *leaderState) {
 		ok := !s.stopping && ls.tick()
 		s.mu.Unlock()
 		if !ok {
-			s.logf("leader: lost quorum, stepping down")
+			s.lg.Warn("★ lost contact with a quorum of followers, stepping down")
 			return
 		}
 	}
@@ -177,7 +188,10 @@ func (ls *leaderState) tick() bool {
 	for _, h := range ls.forwarding {
 		if now.Sub(h.lastSeen) <= s.syncTimeout() {
 			alive++
+		} else {
+			s.lg.Debug("follower is silent", "follower", h.id, "silentFor", now.Sub(h.lastSeen))
 		}
+		s.trace("heartbeat to follower", "follower", h.id)
 		h.conn.Send(&LeaderPing{Zxid: s.lastCommitted})
 	}
 	if alive < s.quorum {
@@ -189,7 +203,7 @@ func (ls *leaderState) tick() bool {
 	for id, ts := range ls.tracker {
 		if !ts.closing && now.After(ts.expires) {
 			ts.closing = true
-			s.logf("session %x expired", id)
+			s.lg.Info("★ session expired: no server heard from it within its timeout", zlog.Session(id), "timeout", ts.timeout)
 			s.propose(ls.closeSessionTxn(&Txn{Zxid: ls.nextZxid(), Time: now.UnixMilli(), SessionID: id}))
 		}
 	}
@@ -221,16 +235,23 @@ func (ls *leaderState) nextZxid() int64 {
 // leaderProcess turns a client write into a transaction and broadcasts it.
 func (s *Server) leaderProcess(f *Forward) {
 	ls := s.leader
-	s.propose(ls.prep(f, ls.nextZxid()))
+	txn := ls.prep(f, ls.nextZxid())
+	s.lg.Debug("request processor: request -> txn", "op", f.Req.Op.String(), "fromServer", f.ServerID, "txn", txn.Type.String())
+	if txn.Type == TxnError {
+		s.lg.Info("✗ write rejected by the leader", "op", f.Req.Op.String(), "path", f.Req.Path,
+			"reason", txn.Err.Err(), zlog.Session(f.SessionID))
+	}
+	s.propose(txn)
 }
 
 // propose logs a transaction and sends it to the followers.
 func (s *Server) propose(txn *Txn) {
 	ls := s.leader
 	if err := s.appendLog(txn); err != nil {
-		s.logf("log append failed: %v", err)
+		s.lg.Error("log append failed", zlog.Err(err))
 		return
 	}
+	s.lg.Debug("PROPOSAL logged and sent to followers", append(txnAttrs(txn), "followers", len(ls.forwarding))...)
 	ls.pending = append(ls.pending, &proposal{txn: txn, acks: map[int64]bool{s.id: true}})
 	for _, h := range ls.forwarding {
 		h.conn.Send(&Proposal{Txn: txn})
@@ -242,6 +263,7 @@ func (ls *leaderState) processAck(from, zxid int64) {
 	for _, p := range ls.pending {
 		if p.txn.Zxid == zxid {
 			p.acks[from] = true
+			ls.s.trace("ACK received", "from", from, zlog.Zxid(zxid), "acks", len(p.acks))
 			break
 		}
 	}
@@ -256,6 +278,7 @@ func (ls *leaderState) tryCommit() {
 		ls.pending[0] = nil
 		ls.pending = ls.pending[1:]
 		z := p.txn.Zxid
+		s.lg.Debug("COMMIT: quorum acknowledged", zlog.Zxid(z), "type", p.txn.Type.String(), "acks", len(p.acks), "quorum", s.quorum)
 		for _, h := range ls.forwarding {
 			h.conn.Send(&Commit{Zxid: z})
 		}
@@ -273,6 +296,7 @@ func (ls *leaderState) tryCommit() {
 func (s *Server) leaderSync(h *learnerHandler, sessionID, xid int64) {
 	ls := s.leader
 	w := syncWaiter{h: h, sessionID: sessionID, xid: xid}
+	s.lg.Debug("sync queued behind outstanding proposals", zlog.Session(sessionID), "outstanding", len(ls.pending))
 	if len(ls.pending) == 0 {
 		ls.replySync(w)
 		return
@@ -310,6 +334,8 @@ func (s *Server) serveLearner(c transport.Conn, info *FollowerInfo) {
 		s.mu.Unlock()
 		return
 	}
+	s.lg.Info("follower connected", "follower", info.ID, "acceptedEpoch", info.AcceptedEpoch,
+		"lastLogged", zlog.ZxidString(info.LastLogged))
 	h := &learnerHandler{id: info.ID, conn: c, lastSeen: time.Now()}
 	if old := ls.learners[info.ID]; old != nil {
 		old.conn.Close()
@@ -335,6 +361,9 @@ func (s *Server) serveLearner(c transport.Conn, info *FollowerInfo) {
 		if ls.learners[h.id] == h {
 			delete(ls.learners, h.id)
 			delete(ls.forwarding, h.id)
+			if s.leader == ls {
+				s.lg.Warn("follower disconnected", "follower", h.id, "remaining", len(ls.forwarding))
+			}
 		}
 		s.mu.Unlock()
 	}()
@@ -354,6 +383,7 @@ func (s *Server) serveLearner(c transport.Conn, info *FollowerInfo) {
 	if !ls.established && (ae.CurrentEpoch > s.currentEpoch ||
 		(ae.CurrentEpoch == s.currentEpoch && ae.LastLogged > s.lastLogged)) {
 		// A follower has a more recent history: we must not lead.
+		s.lg.Warn("follower has a more recent history than us, abandoning leadership", "follower", h.id)
 		ls.abandon = true
 		s.cond.Broadcast()
 		s.mu.Unlock()
@@ -373,12 +403,16 @@ func (s *Server) serveLearner(c transport.Conn, info *FollowerInfo) {
 	// proposal and commit, in order, on this connection.
 	if ae.LastLogged == s.logBase || s.logContains(ae.LastLogged) {
 		entries := append([]*Txn(nil), s.log[s.logIndexAfter(ae.LastLogged):]...)
+		s.lg.Info("synchronizing follower with DIFF", "follower", h.id, "followerLast", zlog.ZxidString(ae.LastLogged),
+			"missingTxns", len(entries))
 		c.Send(&SyncDiff{Entries: entries})
 	} else {
 		s.dbMu.RLock()
 		snap := s.tree.ConsistentSnapshot()
 		s.dbMu.RUnlock()
 		entries := append([]*Txn(nil), s.log[s.logIndexAfter(s.lastCommitted):]...)
+		s.lg.Info("synchronizing follower with SNAP (history diverged or too old)", "follower", h.id,
+			"followerLast", zlog.ZxidString(ae.LastLogged), "snapshotZxid", zlog.ZxidString(snap.Zxid), "znodes", len(snap.Nodes))
 		c.Send(&SyncSnap{Snap: snap, Entries: entries})
 	}
 	c.Send(&NewLeader{Epoch: ls.epoch, CommitZxid: s.lastCommitted})
@@ -395,6 +429,7 @@ func (s *Server) serveLearner(c transport.Conn, info *FollowerInfo) {
 		h.lastSeen = time.Now()
 		switch m := m.(type) {
 		case *AckNewLeader:
+			s.lg.Info("follower acknowledged NEWLEADER", "follower", h.id, "established", ls.established)
 			ls.newLeaderAcks[h.id] = true
 			if ls.established {
 				c.Send(&UpToDate{Zxid: s.lastCommitted})
@@ -403,6 +438,7 @@ func (s *Server) serveLearner(c transport.Conn, info *FollowerInfo) {
 		case *Ack:
 			ls.processAck(h.id, m.Zxid)
 		case *Forward:
+			s.lg.Debug("write forwarded by follower", "follower", h.id, "op", m.Req.Op.String(), "path", m.Req.Path, zlog.Session(m.SessionID))
 			if ls.established {
 				s.leaderProcess(m)
 			}
@@ -411,6 +447,7 @@ func (s *Server) serveLearner(c transport.Conn, info *FollowerInfo) {
 				s.leaderSync(h, m.SessionID, m.Xid)
 			}
 		case *PingReply:
+			s.trace("heartbeat reply", "follower", h.id, "activeSessions", len(m.Sessions))
 			for _, id := range m.Sessions {
 				ls.touch(id)
 			}

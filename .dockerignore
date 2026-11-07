@@ -1,0 +1,10 @@
+.git
+.vscode
+.idea
+*.exe
+*.pdf
+data*/
+**/*_test.go
+Dockerfile
+docker-compose.yml
+README.md

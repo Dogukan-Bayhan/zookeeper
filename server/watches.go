@@ -1,9 +1,11 @@
 package server
 
 import (
+	"log/slog"
 	"sync"
 
 	"zookeeper/zk"
+	"zookeeper/zlog"
 )
 
 // watchManager keeps the one-time watches registered by the sessions
@@ -13,12 +15,14 @@ type watchManager struct {
 	mu    sync.Mutex
 	data  map[string]map[*clientSession]struct{} // getData / exists watches
 	child map[string]map[*clientSession]struct{} // getChildren watches
+	lg    *slog.Logger
 }
 
 func newWatchManager() *watchManager {
 	return &watchManager{
 		data:  map[string]map[*clientSession]struct{}{},
 		child: map[string]map[*clientSession]struct{}{},
+		lg:    zlog.Discard(),
 	}
 }
 
@@ -67,6 +71,7 @@ func (w *watchManager) trigger(path string, typ zk.EventType, zxid int64) {
 	w.mu.Unlock()
 	ev := &zk.WatcherEvent{Type: typ, Path: path, Zxid: zxid}
 	for cs := range targets {
+		w.lg.Debug("watch triggered: notifying client", "event", typ.String(), "path", path, zlog.Session(cs.id), zlog.Zxid(zxid))
 		cs.send(ev)
 	}
 }

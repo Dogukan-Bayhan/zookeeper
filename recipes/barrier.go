@@ -53,6 +53,7 @@ func (b *DoubleBarrier) Enter(ctx context.Context) error {
 	if err := EnsurePath(b.c, b.path); err != nil {
 		return err
 	}
+	lg := logger(b.c, "barrier")
 	ready := zk.Join(b.path, readyNode)
 	// Watch for "ready" before registering so the event cannot be missed.
 	st, ch, err := b.c.ExistsW(ready)
@@ -65,6 +66,7 @@ func (b *DoubleBarrier) Enter(ctx context.Context) error {
 	}
 	for {
 		if st != nil {
+			lg.Info("barrier is ready: everyone arrived, starting", "barrier", b.path)
 			return nil
 		}
 		members, err := b.participants()
@@ -72,11 +74,13 @@ func (b *DoubleBarrier) Enter(ctx context.Context) error {
 			return err
 		}
 		if len(members) >= b.size {
+			lg.Info("we completed the group: creating ready znode", "barrier", b.path, "members", len(members))
 			if _, err := b.c.Create(ready, nil, zk.FlagPersistent); err != nil && !errors.Is(err, zk.ErrNodeExists) {
 				return err
 			}
 			return nil
 		}
+		lg.Info("entered barrier, waiting for the others", "barrier", b.path, "arrived", len(members), "needed", b.size)
 		if err := wait(ctx, ch); err != nil {
 			return err
 		}
@@ -97,6 +101,7 @@ func (b *DoubleBarrier) Leave(ctx context.Context) error {
 			return err
 		}
 		if len(members) == 0 {
+			logger(b.c, "barrier").Info("everyone left the barrier", "barrier", b.path)
 			return nil
 		}
 		if len(members) == 1 && members[0] == b.name {
@@ -123,6 +128,8 @@ func (b *DoubleBarrier) Leave(ctx context.Context) error {
 		if st == nil {
 			continue
 		}
+		logger(b.c, "barrier").Info("leaving: waiting for others to finish", "barrier", b.path,
+			"remaining", len(members), "watching", target)
 		if err := wait(ctx, ch); err != nil {
 			return err
 		}
@@ -161,7 +168,10 @@ func (e *Election) Campaign(ctx context.Context, data []byte) error {
 		return err
 	}
 	e.node = node
-	err = waitTurn(ctx, e.c, e.dir, node, func(_ []seqNode, me int) int { return me - 1 }, "n-")
+	err = waitTurn(ctx, e.c, "election", e.dir, node, func(_ []seqNode, me int) int { return me - 1 }, "n-")
+	if err == nil {
+		logger(e.c, "election").Info("👑 elected leader (lowest sequence number)", "node", node)
+	}
 	if err != nil {
 		e.c.Delete(node, zk.AnyVersion)
 		e.node = ""
@@ -174,10 +184,14 @@ func (e *Election) Resign() error {
 	if e.node == "" {
 		return nil
 	}
+	logger(e.c, "election").Info("resigning leadership", "node", e.node)
 	err := e.c.Delete(e.node, zk.AnyVersion)
 	e.node = ""
 	return err
 }
+
+// Node returns the candidate znode (empty if not campaigning).
+func (e *Election) Node() string { return e.node }
 
 // Leader returns the data of the current leader, or zk.ErrNoNode if there is
 // none. It syncs first so that the answer is not stale.

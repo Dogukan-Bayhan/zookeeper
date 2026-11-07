@@ -4,6 +4,7 @@ import (
 	"time"
 
 	"zookeeper/transport"
+	"zookeeper/zlog"
 )
 
 // Leader election. The details of leader election are outside the scope of
@@ -79,6 +80,7 @@ func (s *Server) peerSendLoop(id int64, ps *peerSender) {
 		if c == nil {
 			conn, err := s.cfg.Transport.Dial(s.cfg.Peers[id], s.cfg.TickTime*5)
 			if err != nil {
+				s.trace("peer unreachable, dropping election message", "peer", id, zlog.Err(err))
 				continue
 			}
 			if !s.trackConn(conn) {
@@ -130,6 +132,7 @@ func (s *Server) handleNotification(n *Notification) {
 		Epoch: s.currentEpoch, Round: n.Round, State: state,
 	}
 	s.mu.Unlock()
+	s.lg.Debug("looking peer asked for the leader: telling it", "peer", n.From, "leader", reply.Leader, "myState", state)
 	s.sendPeer(n.From, reply)
 }
 
@@ -152,6 +155,7 @@ func (s *Server) lookForLeader() (int64, bool) {
 		}
 	}
 
+	s.lg.Info("election round started", "round", round, voteAttr("myVote", self))
 	cur := self
 	votes := map[int64]vote{}           // LOOKING peers, current round
 	others := map[int64]*Notification{} // peers in an established ensemble
@@ -186,6 +190,7 @@ func (s *Server) lookForLeader() (int64, bool) {
 		if n.From == s.id {
 			continue
 		}
+		s.trace("notification received", "from", n.From, "state", n.State, "round", n.Round, voteAttr("vote", n.vote()))
 
 		if n.State != Looking {
 			delete(votes, n.From)
@@ -199,6 +204,7 @@ func (s *Server) lookForLeader() (int64, bool) {
 					}
 				}
 				if count >= s.quorum && l != s.id {
+					s.lg.Info("found an established ensemble, joining it", "leader", l, "supporters", count)
 					return l, true
 				}
 			}
@@ -208,6 +214,7 @@ func (s *Server) lookForLeader() (int64, bool) {
 		delete(others, n.From)
 		switch {
 		case n.Round > round:
+			s.lg.Debug("newer election round seen, adopting it", "from", n.From, "round", n.Round)
 			round = n.Round
 			s.mu.Lock()
 			s.round = round
@@ -225,6 +232,7 @@ func (s *Server) lookForLeader() (int64, bool) {
 			continue
 		default:
 			if better(n.vote(), cur) {
+				s.lg.Debug("better vote received, changing my vote", "from", n.From, voteAttr("newVote", n.vote()))
 				cur = n.vote()
 				notify()
 			}
@@ -242,6 +250,7 @@ func (s *Server) lookForLeader() (int64, bool) {
 			continue
 		}
 		// A quorum agrees: wait briefly for a better vote before deciding.
+		s.lg.Debug("quorum agrees on vote, waiting for late better votes", voteAttr("vote", cur), "agree", agree)
 		improved := false
 		deadline := time.NewTimer(finalize)
 	wait:
@@ -262,6 +271,7 @@ func (s *Server) lookForLeader() (int64, bool) {
 		}
 		deadline.Stop()
 		if !improved {
+			s.lg.Info("election decided by quorum", "round", round, "leader", cur.leader, "agree", agree)
 			return cur.leader, true
 		}
 	}

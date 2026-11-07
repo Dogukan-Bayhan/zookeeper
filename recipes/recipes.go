@@ -8,12 +8,18 @@ package recipes
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"sort"
 	"strings"
 
 	"zookeeper/client"
 	"zookeeper/zk"
 )
+
+// logger returns the client's logger tagged with the recipe name.
+func logger(c *client.Client, recipe string) *slog.Logger {
+	return c.Logger().With("comp", recipe)
+}
 
 // EnsurePath creates path and its missing ancestors as regular znodes.
 func EnsurePath(c *client.Client, path string) error {
@@ -76,9 +82,11 @@ func sortedSeq(children []string, prefixes ...string) []seqNode {
 // a notification only says the cached copy is stale. It returns when the
 // context is done.
 func WatchConfig(ctx context.Context, c *client.Client, zc string, onChange func(data []byte, st *zk.Stat)) error {
+	lg := logger(c, "config")
 	for {
 		data, st, ch, err := c.GetDataW(zc)
 		if errors.Is(err, zk.ErrNoNode) {
+			lg.Info("config znode does not exist yet, waiting for its creation", "path", zc)
 			st, ech, err := c.ExistsW(zc)
 			if err != nil {
 				return err
@@ -93,10 +101,12 @@ func WatchConfig(ctx context.Context, c *client.Client, zc string, onChange func
 		if err != nil {
 			return err
 		}
+		lg.Info("config read, watch set for the next change", "path", zc, "version", st.Version, "bytes", len(data))
 		onChange(data, st)
 		if err := wait(ctx, ch); err != nil {
 			return err
 		}
+		lg.Info("config change notification: cached copy is stale, re-reading", "path", zc)
 	}
 }
 
@@ -133,6 +143,9 @@ func OpenRendezvous(c *client.Client, path string) *Rendezvous {
 // Publish fills in the rendezvous information (master side).
 func (r *Rendezvous) Publish(info []byte) error {
 	_, err := r.c.SetData(r.path, info, zk.AnyVersion)
+	if err == nil {
+		logger(r.c, "rendezvous").Info("published rendezvous information", "path", r.path, "info", string(info))
+	}
 	return err
 }
 
@@ -158,8 +171,10 @@ func (r *Rendezvous) Wait(ctx context.Context) ([]byte, error) {
 			return nil, err
 		}
 		if len(data) > 0 {
+			logger(r.c, "rendezvous").Info("rendezvous information available", "path", r.path, "info", string(data))
 			return data, nil
 		}
+		logger(r.c, "rendezvous").Info("rendezvous not filled in yet, waiting on watch", "path", r.path)
 		if err := wait(ctx, ch); err != nil {
 			return nil, err
 		}
@@ -174,10 +189,17 @@ func (r *Rendezvous) Wait(ctx context.Context) ([]byte, error) {
 // member disappears automatically when the session ends. It returns the
 // path of the member znode.
 func JoinGroup(c *client.Client, zg, name string, info []byte) (string, error) {
+	var p string
+	var err error
 	if name == "" {
-		return c.Create(zk.Join(zg, "member-"), info, zk.FlagEphemeral|zk.FlagSequential)
+		p, err = c.Create(zk.Join(zg, "member-"), info, zk.FlagEphemeral|zk.FlagSequential)
+	} else {
+		p, err = c.Create(zk.Join(zg, name), info, zk.FlagEphemeral)
 	}
-	return c.Create(zk.Join(zg, name), info, zk.FlagEphemeral)
+	if err == nil {
+		logger(c, "group").Info("joined group with an ephemeral znode (removed automatically if we die)", "member", p)
+	}
+	return p, err
 }
 
 // Members lists the members of a group.
@@ -193,6 +215,7 @@ func WatchMembers(ctx context.Context, c *client.Client, zg string, onChange fun
 		if err != nil {
 			return err
 		}
+		logger(c, "group").Debug("membership read, watching for changes", "group", zg, "members", len(members))
 		onChange(members)
 		if err := wait(ctx, ch); err != nil {
 			return err

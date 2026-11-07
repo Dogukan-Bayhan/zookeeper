@@ -5,14 +5,17 @@ import (
 
 	"zookeeper/transport"
 	"zookeeper/zk"
+	"zookeeper/zlog"
 )
 
 // follow runs the follower role: connect to the leader, take part in
 // discovery and synchronization, then log proposals, acknowledge them and
 // apply commits in order.
 func (s *Server) follow(leaderID int64) {
+	s.lg.Info("★ FOLLOWING: connecting to leader", "leader", leaderID, "addr", s.cfg.Peers[leaderID])
 	c, err := s.cfg.Transport.Dial(s.cfg.Peers[leaderID], s.initTimeout())
 	if err != nil {
+		s.lg.Warn("cannot reach leader", "leader", leaderID, zlog.Err(err))
 		s.pause(s.cfg.TickTime)
 		return
 	}
@@ -38,11 +41,14 @@ func (s *Server) follow(leaderID int64) {
 	m, ok := recvTimeout(in, s.initTimeout(), s.quit)
 	li, isInfo := m.(*LeaderInfo)
 	if !ok || !isInfo {
+		s.lg.Warn("leader did not answer with LEADERINFO in time", "leader", leaderID)
 		return
 	}
+	s.lg.Info("discovery: leader proposes epoch", "epoch", li.Epoch)
 	s.mu.Lock()
 	if li.Epoch < s.acceptedEpoch {
 		s.mu.Unlock()
+		s.lg.Warn("rejecting stale epoch", "epoch", li.Epoch, "acceptedEpoch", s.acceptedEpoch)
 		return
 	}
 	if li.Epoch > s.acceptedEpoch {
@@ -61,7 +67,7 @@ func (s *Server) follow(leaderID int64) {
 		}
 		m, ok := recvTimeout(in, timeout, s.quit)
 		if !ok {
-			s.logf("follower: lost leader %d", leaderID)
+			s.lg.Warn("★ lost the leader (no message within timeout or connection closed)", "leader", leaderID, "timeout", timeout)
 			return
 		}
 		if !s.followerHandle(c, m, &synced) {
@@ -83,16 +89,17 @@ func (s *Server) followerHandle(c transport.Conn, m any, synced *bool) bool {
 		err := s.appendLog(fresh...)
 		s.mu.Unlock()
 		if err != nil {
-			s.logf("follower: %v", err)
+			s.lg.Error("logging DIFF failed", zlog.Err(err))
 			return false
 		}
+		s.lg.Info("synchronization: received DIFF", "txns", len(fresh))
 
 	case *SyncSnap:
 		s.mu.Lock()
 		err := s.installSnapshot(m.Snap, m.Entries)
 		s.mu.Unlock()
 		if err != nil {
-			s.logf("follower: installing snapshot: %v", err)
+			s.lg.Error("installing snapshot failed", zlog.Err(err))
 			return false
 		}
 
@@ -101,6 +108,8 @@ func (s *Server) followerHandle(c transport.Conn, m any, synced *bool) bool {
 		s.currentEpoch = m.Epoch
 		s.acceptedEpoch = max(s.acceptedEpoch, m.Epoch)
 		s.saveEpochs()
+		s.lg.Info("NEWLEADER received: adopting epoch and committing up to", "epoch", m.Epoch,
+			"commit", zlog.ZxidString(m.CommitZxid), "from", zlog.ZxidString(s.lastCommitted))
 		s.applyCommitted(m.CommitZxid)
 		var inflight []int64
 		for i := s.logIndexAfter(m.CommitZxid); i < len(s.log); i++ {
@@ -118,6 +127,7 @@ func (s *Server) followerHandle(c transport.Conn, m any, synced *bool) bool {
 		s.mu.Unlock()
 		s.serving.Store(true)
 		*synced = true
+		s.lg.Info("★ UPTODATE: synchronized with leader, serving clients", "lastZxid", zlog.ZxidString(s.LastZxid()))
 
 	case *Proposal:
 		s.mu.Lock()
@@ -126,15 +136,16 @@ func (s *Server) followerHandle(c transport.Conn, m any, synced *bool) bool {
 			(epochOf(z) > epochOf(last) && counterOf(z) == 1)
 		if !inOrder {
 			s.mu.Unlock()
-			s.logf("follower: out of order proposal %x after %x", z, last)
+			s.lg.Warn("out of order proposal, resynchronizing", "got", zlog.ZxidString(z), "last", zlog.ZxidString(last))
 			return false
 		}
 		err := s.appendLog(m.Txn)
 		s.mu.Unlock()
 		if err != nil {
-			s.logf("follower: %v", err)
+			s.lg.Error("log append failed", zlog.Err(err))
 			return false
 		}
+		s.lg.Debug("PROPOSAL logged to disk, sending ACK", txnAttrs(m.Txn)...)
 		c.Send(&Ack{Zxid: z})
 
 	case *Commit:
@@ -143,13 +154,16 @@ func (s *Server) followerHandle(c transport.Conn, m any, synced *bool) bool {
 			s.mu.Unlock()
 			return false
 		}
+		s.lg.Debug("COMMIT received", zlog.Zxid(m.Zxid))
 		s.applyCommitted(m.Zxid)
 		s.mu.Unlock()
 
 	case *LeaderPing:
+		s.trace("heartbeat from leader", "leaderCommitted", zlog.ZxidString(m.Zxid))
 		c.Send(&PingReply{Sessions: s.drainTouched()})
 
 	case *SyncReply:
+		s.lg.Debug("sync completed by leader", zlog.Session(m.SessionID))
 		s.completeLocal(m.SessionID, m.Xid, &zk.Response{Xid: m.Xid, Zxid: s.LastZxid()})
 	}
 	return true

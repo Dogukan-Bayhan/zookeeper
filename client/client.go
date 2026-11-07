@@ -10,7 +10,10 @@
 package client
 
 import (
+	"context"
 	"errors"
+	"fmt"
+	"log/slog"
 	"math/rand/v2"
 	"slices"
 	"sync"
@@ -18,6 +21,7 @@ import (
 
 	"zookeeper/transport"
 	"zookeeper/zk"
+	"zookeeper/zlog"
 )
 
 // Config configures a client.
@@ -35,6 +39,11 @@ type Config struct {
 	// ConnectTimeout bounds how long Connect waits for the first session
 	// (default: SessionTimeout).
 	ConnectTimeout time.Duration
+	// Name identifies the client in logs (default "client").
+	Name string
+	// Logger receives logs of every step: connection attempts, session
+	// establishment, requests, responses, watches; nil disables logging.
+	Logger *slog.Logger
 }
 
 type watchKind int
@@ -61,6 +70,7 @@ type call struct {
 // Client is a ZooKeeper session.
 type Client struct {
 	cfg    Config
+	lg     *slog.Logger
 	events *dispatcher
 	kick   chan struct{} // closed by Close
 	done   chan struct{} // closed when the connection loop exits
@@ -76,6 +86,7 @@ type Client struct {
 	xid       int64
 	sent      []*call // awaiting a response, in order
 	unsent    []*call // issued while disconnected
+	server    string  // address of the current server
 	lastRecv  time.Time
 	lastSend  time.Time
 	firstOnce sync.Once
@@ -99,8 +110,12 @@ func Connect(cfg Config) (*Client, error) {
 	if cfg.ConnectTimeout <= 0 {
 		cfg.ConnectTimeout = cfg.SessionTimeout
 	}
+	if cfg.Name == "" {
+		cfg.Name = "client"
+	}
 	c := &Client{
 		cfg:     cfg,
+		lg:      zlog.OrDiscard(cfg.Logger).With("comp", cfg.Name),
 		events:  newDispatcher(),
 		kick:    make(chan struct{}),
 		done:    make(chan struct{}),
@@ -111,16 +126,32 @@ func Connect(cfg Config) (*Client, error) {
 		existW:  map[string][]*watcher{},
 		childW:  map[string][]*watcher{},
 	}
+	c.lg.Info("connecting to ensemble", "servers", fmt.Sprint(cfg.Servers), "sessionTimeout", cfg.SessionTimeout)
 	go c.loop()
 	select {
 	case <-c.first:
 	case <-time.After(cfg.ConnectTimeout):
 	}
 	if c.State() != zk.StateConnected {
+		c.lg.Error("could not establish a session", "after", cfg.ConnectTimeout)
 		c.Close()
 		return nil, zk.ErrConnectionLoss
 	}
 	return c, nil
+}
+
+// Logger returns the client's logger; recipes built on the client log
+// through it.
+func (c *Client) Logger() *slog.Logger { return c.lg }
+
+// Name returns the client name used in logs.
+func (c *Client) Name() string { return c.cfg.Name }
+
+// Server returns the address of the server the client is connected to.
+func (c *Client) Server() string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.server
 }
 
 // SessionID returns the session id.
@@ -161,7 +192,9 @@ func (c *Client) Close() error {
 	}
 	c.closing = true
 	live := c.state == zk.StateConnected
+	sid := c.sessionID
 	c.mu.Unlock()
+	c.lg.Info("closing session (ephemeral znodes will be removed)", zlog.Session(sid))
 
 	if live {
 		ch := make(chan struct{}, 1)
@@ -220,11 +253,13 @@ func (c *Client) loop() {
 			return
 		}
 		addr := servers[i%len(servers)]
+		c.lg.Debug("dialing server", "server", addr)
 		conn, err := c.cfg.Transport.Dial(addr, c.cfg.SessionTimeout/3)
 		if err != nil {
+			c.lg.Debug("server unreachable, trying next", "server", addr, zlog.Err(err))
 			continue
 		}
-		switch c.handshake(conn) {
+		switch c.handshake(conn, addr) {
 		case handshakeExpired:
 			conn.Close()
 			c.expire()
@@ -255,7 +290,7 @@ func (c *Client) watchPaths(m map[string][]*watcher) []string {
 	return out
 }
 
-func (c *Client) handshake(conn transport.Conn) handshakeResult {
+func (c *Client) handshake(conn transport.Conn, addr string) handshakeResult {
 	c.mu.Lock()
 	req := &zk.ConnectRequest{
 		SessionID:    c.sessionID,
@@ -288,13 +323,16 @@ func (c *Client) handshake(conn transport.Conn) handshakeResult {
 	}
 	resp, ok := r.m.(*zk.ConnectResponse)
 	if r.err != nil || !ok {
+		c.lg.Debug("handshake failed", "server", addr)
 		return handshakeRetry
 	}
 	switch resp.Err {
 	case zk.CodeOK:
 	case zk.CodeSessionExpired:
+		c.lg.Error("★ server says our session has EXPIRED", "server", addr, zlog.Session(req.SessionID))
 		return handshakeExpired
 	default:
+		c.lg.Info("server refused the session, trying another", "server", addr, "reason", resp.Err.Err())
 		return handshakeRetry
 	}
 
@@ -307,7 +345,16 @@ func (c *Client) handshake(conn transport.Conn) handshakeResult {
 	c.timeout = time.Duration(resp.Timeout) * time.Millisecond
 	c.lastZxid = max(c.lastZxid, resp.Zxid)
 	c.conn = conn
+	c.server = addr
 	c.state = zk.StateConnected
+	if req.SessionID == 0 {
+		c.lg.Info("★ session established", "server", addr, zlog.Session(resp.SessionID),
+			"timeout", c.timeout)
+	} else {
+		c.lg.Info("★ session re-established on another server", "server", addr, zlog.Session(resp.SessionID),
+			"lastZxid", zlog.ZxidString(req.LastZxid), "watchesReRegistered",
+			len(req.DataWatches)+len(req.ExistWatches)+len(req.ChildWatches), "queuedRequests", len(c.unsent))
+	}
 	c.lastRecv, c.lastSend = time.Now(), time.Now()
 	for _, cl := range c.unsent {
 		c.sent = append(c.sent, cl)
@@ -351,9 +398,12 @@ func (c *Client) serve(conn transport.Conn) {
 		now := time.Now()
 		if now.Sub(c.lastRecv) > 2*timeout/3 {
 			c.mu.Unlock()
+			c.lg.Warn("server silent for 2/3 of the session timeout, switching server", "server", c.Server(),
+				"silentFor", now.Sub(c.lastRecv))
 			return
 		}
 		if now.Sub(c.lastSend) >= timeout/3 {
+			c.lg.Log(context.Background(), zlog.LevelTrace, "idle for 1/3 of the session timeout, sending heartbeat")
 			conn.Send(&zk.Request{Xid: zk.PingXid, Op: zk.OpPing})
 			c.lastSend = now
 		}
@@ -373,6 +423,7 @@ func (c *Client) handleMsg(m any) bool {
 		}
 		if len(c.sent) == 0 || c.sent[0].req.Xid != m.Xid {
 			c.mu.Unlock()
+			c.lg.Error("protocol violation: response out of order", "xid", m.Xid)
 			return false // protocol violation: responses must be in order
 		}
 		cl := c.sent[0]
@@ -380,6 +431,8 @@ func (c *Client) handleMsg(m any) bool {
 		c.sent = c.sent[1:]
 		c.registerWatch(cl, m)
 		c.mu.Unlock()
+		c.lg.Debug("← response", "op", cl.req.Op.String(), "path", cl.req.Path, "xid", m.Xid,
+			"result", m.Err.Err(), zlog.Zxid(m.Zxid))
 		c.events.push(func() { cl.cb(m, m.Err.Err()) })
 	case *zk.WatcherEvent:
 		c.mu.Lock()
@@ -387,6 +440,7 @@ func (c *Client) handleMsg(m any) bool {
 		c.lastZxid = max(c.lastZxid, m.Zxid)
 		ws := c.takeWatchers(m.Path, m.Type)
 		c.mu.Unlock()
+		c.lg.Debug("⚡ watch event received", "event", m.Type.String(), "path", m.Path, "watchers", len(ws))
 		ev := zk.Event{Type: m.Type, State: zk.StateConnected, Path: m.Path}
 		c.events.push(func() {
 			for _, w := range ws {
@@ -412,6 +466,7 @@ func (c *Client) disconnected() {
 		c.fail(cl, zk.ErrConnectionLoss)
 	}
 	if notify {
+		c.lg.Warn("★ connection lost, will reconnect to another server", "failedInFlight", len(failed))
 		c.sessionEvent(zk.StateDisconnected)
 	}
 }
@@ -430,6 +485,8 @@ func (c *Client) expire() {
 	}
 	c.mu.Unlock()
 	c.firstOnce.Do(func() { close(c.first) })
+	c.lg.Error("★ session expired: ephemeral znodes are gone, watches dropped", "failedRequests", len(pending),
+		"watchers", len(ws))
 	for _, cl := range pending {
 		c.fail(cl, zk.ErrSessionExpired)
 	}
@@ -474,6 +531,7 @@ func (c *Client) registerWatch(cl *call, r *zk.Response) {
 		return
 	}
 	m[cl.req.Path] = append(m[cl.req.Path], cl.w)
+	c.lg.Debug("watch registered", "path", cl.req.Path, "kind", [...]string{"", "data", "exists", "children"}[cl.kind])
 }
 
 func (c *Client) takeWatchers(path string, t zk.EventType) []*watcher {
@@ -532,14 +590,21 @@ func (c *Client) do(req *zk.Request, kind watchKind, w *watcher, cb func(*zk.Res
 	}
 	c.xid++
 	req.Xid = c.xid
+	queued := false
 	if c.conn != nil && c.state == zk.StateConnected {
 		c.sent = append(c.sent, cl)
 		c.conn.Send(req)
 		c.lastSend = time.Now()
 	} else {
 		c.unsent = append(c.unsent, cl)
+		queued = true
 	}
 	c.mu.Unlock()
+	if queued {
+		c.lg.Debug("→ request queued until reconnected", "op", req.Op.String(), "path", req.Path, "xid", req.Xid)
+	} else {
+		c.lg.Debug("→ request", "op", req.Op.String(), "path", req.Path, "xid", req.Xid, "watch", req.Watch)
+	}
 }
 
 type result struct {

@@ -7,6 +7,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"log/slog"
 	"os"
 	"os/signal"
 	"strconv"
@@ -14,6 +15,7 @@ import (
 	"time"
 
 	"zookeeper/server"
+	"zookeeper/zlog"
 )
 
 func main() {
@@ -23,7 +25,7 @@ func main() {
 	tick := flag.Duration("tick", 100*time.Millisecond, "tick time")
 	fsync := flag.Bool("fsync", true, "force log writes to disk before acknowledging")
 	snapCount := flag.Int("snapcount", 10000, "transactions between snapshots")
-	verbose := flag.Bool("v", false, "verbose logging")
+	level := flag.String("log", "info", "log level: trace, debug, info, warn")
 	flag.Parse()
 
 	peers := map[int64]string{}
@@ -48,9 +50,13 @@ func main() {
 		defer st.Close()
 		cfg.Storage = st
 	}
-	if *verbose {
-		cfg.Logger = log.New(os.Stderr, "", log.LstdFlags|log.Lmicroseconds)
+	lvl, err := zlog.ParseLevel(*level)
+	if err != nil {
+		log.Fatal(err)
 	}
+	logger := zlog.NewTerminal(lvl)
+	slog.SetDefault(logger)
+	cfg.Logger = logger
 	s, err := server.New(cfg)
 	if err != nil {
 		log.Fatal(err)
@@ -58,17 +64,7 @@ func main() {
 	if err := s.Start(); err != nil {
 		log.Fatal(err)
 	}
-	fmt.Printf("zkserver %d listening on %s (ensemble of %d)\n", *id, peers[*id], len(peers))
-
-	go func() {
-		last := server.Stopped
-		for range time.Tick(time.Second) {
-			if st := s.State(); st != last {
-				fmt.Printf("state: %v (leader %d)\n", st, s.LeaderID())
-				last = st
-			}
-		}
-	}()
+	fmt.Printf("zkserver %d listening on %s (ensemble of %d, log level %s)\n", *id, peers[*id], len(peers), *level)
 
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, os.Interrupt)

@@ -2,7 +2,6 @@ package tests
 
 import (
 	"fmt"
-	"log"
 	"os"
 	"sort"
 	"testing"
@@ -11,6 +10,7 @@ import (
 	"zookeeper/client"
 	"zookeeper/server"
 	"zookeeper/transport"
+	"zookeeper/zlog"
 )
 
 const tick = 20 * time.Millisecond
@@ -60,8 +60,9 @@ func (c *cluster) config(id int64) server.Config {
 		SyncLimit: 8,
 		SnapCount: c.snapCount,
 	}
-	if os.Getenv("ZK_DEBUG") != "" {
-		cfg.Logger = log.New(os.Stderr, "", log.Lmicroseconds)
+	if lv := os.Getenv("ZK_LOG"); lv != "" {
+		level, _ := zlog.ParseLevel(lv)
+		cfg.Logger = zlog.NewTerminal(level)
 	}
 	return cfg
 }

@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"slices"
+	"strings"
+	"time"
 
 	"zookeeper/client"
 	"zookeeper/zk"
@@ -27,9 +29,11 @@ func NewSimpleLock(c *client.Client, path string) *SimpleLock {
 
 // Lock acquires the lock.
 func (l *SimpleLock) Lock(ctx context.Context) error {
+	lg := logger(l.c, "simplelock")
 	for {
 		_, err := l.c.Create(l.path, nil, zk.FlagEphemeral)
 		if err == nil {
+			lg.Info("🔒 lock acquired (created lock file)", "path", l.path)
 			return nil
 		}
 		if !errors.Is(err, zk.ErrNodeExists) {
@@ -42,6 +46,7 @@ func (l *SimpleLock) Lock(ctx context.Context) error {
 		if st == nil {
 			continue
 		}
+		lg.Info("lock is held by someone else, waiting for its deletion (herd effect: all waiters wake up)", "path", l.path)
 		if err := wait(ctx, ch); err != nil {
 			return err
 		}
@@ -50,6 +55,7 @@ func (l *SimpleLock) Lock(ctx context.Context) error {
 
 // Unlock releases the lock.
 func (l *SimpleLock) Unlock() error {
+	logger(l.c, "simplelock").Info("🔓 lock released", "path", l.path)
 	return l.c.Delete(l.path, zk.AnyVersion)
 }
 
@@ -91,7 +97,7 @@ func (l *Lock) Lock(ctx context.Context) error {
 		return err
 	}
 	l.node = node
-	err = waitTurn(ctx, l.c, l.dir, node, func(nodes []seqNode, me int) int {
+	err = waitTurn(ctx, l.c, "lock", l.dir, node, func(nodes []seqNode, me int) int {
 		return me - 1 // the znode just before ours, -1 if we are first
 	}, "lock-")
 	if err != nil {
@@ -106,6 +112,8 @@ func (l *Lock) Unlock() error {
 	if l.node == "" {
 		return errors.New("recipes: lock not held")
 	}
+	logger(l.c, "lock").Info("🔓 lock released (deleting our znode wakes up exactly one waiter)", "node", l.node)
+	logger(l.c, "rwlock").Info("🔓 released", "node", l.node)
 	err := l.c.Delete(l.node, zk.AnyVersion)
 	l.node = ""
 	return err
@@ -121,11 +129,22 @@ func enqueue(c *client.Client, dir, prefix string) (string, error) {
 	return c.Create(zk.Join(dir, prefix), nil, zk.FlagEphemeral|zk.FlagSequential)
 }
 
+func describe(nodes []seqNode) []string {
+	out := make([]string, len(nodes))
+	for i, n := range nodes {
+		out[i] = n.name
+	}
+	return out
+}
+
 // waitTurn implements lines 2-6 of the lock procedures: blocker returns the
 // index of the znode that must go away before we may proceed, or -1.
-func waitTurn(ctx context.Context, c *client.Client, dir, node string,
+func waitTurn(ctx context.Context, c *client.Client, recipe, dir, node string,
 	blocker func(nodes []seqNode, me int) int, prefixes ...string) error {
+	lg := logger(c, recipe)
 	name := zk.Base(node)
+	start := time.Now()
+	lg.Info("queued: created EPHEMERAL|SEQUENTIAL znode", "node", node)
 	for {
 		children, err := c.GetChildren(dir, false)
 		if err != nil {
@@ -138,6 +157,7 @@ func waitTurn(ctx context.Context, c *client.Client, dir, node string,
 		}
 		b := blocker(nodes, me)
 		if b < 0 {
+			lg.Info("🔒 our turn: acquired", "node", node, "position", me, "waited", time.Since(start))
 			return nil
 		}
 		st, ch, err := c.ExistsW(zk.Join(dir, nodes[b].name))
@@ -147,9 +167,12 @@ func waitTurn(ctx context.Context, c *client.Client, dir, node string,
 		if st == nil {
 			continue // already gone, re-check
 		}
+		lg.Info("waiting: watching only the znode before ours (no herd effect)", "node", name,
+			"watching", nodes[b].name, "queue", strings.Join(describe(nodes), ","))
 		if err := wait(ctx, ch); err != nil {
 			return err
 		}
+		lg.Debug("predecessor gone, re-checking the queue", "gone", nodes[b].name)
 	}
 }
 
@@ -211,7 +234,7 @@ func (l *RWLock) acquire(ctx context.Context, prefix string, blocker func([]seqN
 		return err
 	}
 	l.node = node
-	if err := waitTurn(ctx, l.c, l.dir, node, blocker, "read-", "write-"); err != nil {
+	if err := waitTurn(ctx, l.c, "rwlock", l.dir, node, blocker, "read-", "write-"); err != nil {
 		l.c.Delete(node, zk.AnyVersion)
 		l.node = ""
 		return err

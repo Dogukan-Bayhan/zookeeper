@@ -1,0 +1,102 @@
+# ZooKeeper (Go) — Docker setups
+#
+#   docker compose up -d --build              web lab → http://localhost:8080
+#   docker compose --profile cluster up -d    real distributed setup: 3 zkserver containers + apps
+#   docker compose logs -f zk1 zk2 zk3        server logs      (… api-1 gateway scheduler-1 …)
+#   docker compose stop zk2                   crash a ZooKeeper server, `start zk2` to bring it back
+#   docker compose --profile cluster run --rm cli zkapp config-set rateLimit=50
+#   docker compose --profile cluster down -v  stop everything and wipe the server data
+
+name: zookeeper-go
+
+x-image: &image
+  image: zookeeper-go:latest
+  build: .
+  environment:
+    FORCE_COLOR: "1"
+
+x-zk-servers: &zks "zk1:2181,zk2:2181,zk3:2181"
+x-ensemble: &ensemble "1=zk1:2181,2=zk2:2181,3=zk3:2181"
+
+x-app: &app
+  <<: *image
+  profiles: [cluster]
+  restart: unless-stopped
+  depends_on: [zk1, zk2, zk3]
+
+services:
+  # ---------------------------------------------------------------- web lab
+  lab:
+    <<: *image
+    profiles: [lab]
+    command: ["zkapp", "web", "-addr", "0.0.0.0:8080"]
+    ports: ["8080:8080"]
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/api/state"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+
+  # ---------------------------------------------------------------- ZooKeeper ensemble
+  zk1: &zk
+    <<: *image
+    profiles: [cluster]
+    hostname: zk1
+    command: ["zkserver", "-id", "1", "-servers", *ensemble, "-dir", "/data", "-log", "info"]
+    volumes: [zk1-data:/data]
+    ports: ["2181:2181"]
+    restart: unless-stopped
+  zk2:
+    <<: *zk
+    hostname: zk2
+    command: ["zkserver", "-id", "2", "-servers", *ensemble, "-dir", "/data", "-log", "info"]
+    volumes: [zk2-data:/data]
+    ports: ["2182:2181"]
+  zk3:
+    <<: *zk
+    hostname: zk3
+    command: ["zkserver", "-id", "3", "-servers", *ensemble, "-dir", "/data", "-log", "info"]
+    volumes: [zk3-data:/data]
+    ports: ["2183:2181"]
+
+  # ---------------------------------------------------------------- applications
+  api-1:
+    <<: *app
+    hostname: api-1
+    command: ["zkapp", "service", "-name", "api-1", "-servers", *zks, "-listen", "0.0.0.0:8000", "-advertise", "api-1:8000", "-log", "info"]
+  api-2:
+    <<: *app
+    hostname: api-2
+    command: ["zkapp", "service", "-name", "api-2", "-servers", *zks, "-listen", "0.0.0.0:8000", "-advertise", "api-2:8000", "-log", "info"]
+  gateway:
+    <<: *app
+    command: ["zkapp", "gateway", "-name", "gateway", "-servers", *zks, "-interval", "2s", "-log", "info"]
+  scheduler-1:
+    <<: *app
+    command: ["zkapp", "scheduler", "-name", "scheduler-1", "-servers", *zks, "-interval", "3s", "-log", "info"]
+  scheduler-2:
+    <<: *app
+    command: ["zkapp", "scheduler", "-name", "scheduler-2", "-servers", *zks, "-interval", "3s", "-log", "info"]
+  shop-1:
+    <<: *app
+    command: ["zkapp", "config-service", "-name", "shop-1", "-servers", *zks, "-log", "info"]
+  worker-1:
+    <<: *app
+    command: ["zkapp", "queue-worker", "-name", "worker-1", "-servers", *zks, "-log", "info"]
+
+  # one-off commands: docker compose --profile cluster run --rm cli zkapp <command> ...
+  cli:
+    <<: *image
+    profiles: [tools]
+    depends_on: []
+    entrypoint: []
+    command: ["zkapp", "tree", "/"]
+    environment:
+      FORCE_COLOR: "1"
+      ZK_SERVERS: *zks
+
+volumes:
+  zk1-data:
+  zk2-data:
+  zk3-data:

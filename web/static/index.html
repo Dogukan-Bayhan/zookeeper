@@ -1,0 +1,618 @@
+<!doctype html>
+<html lang="tr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ZooKeeper Lab</title>
+<style>
+:root{
+  --bg:#f5f6f8; --card:#fff; --line:#e5e7eb; --line2:#eef0f3; --text:#111827; --muted:#6b7280; --faint:#9ca3af;
+  --accent:#4f46e5; --accent-soft:#eef2ff; --green:#16a34a; --green-soft:#ecfdf5; --red:#dc2626; --red-soft:#fef2f2;
+  --amber:#d97706; --amber-soft:#fffbeb; --gold:#ca8a04;
+  --mono: ui-monospace,"Cascadia Code","JetBrains Mono",Consolas,monospace;
+  --radius:12px;
+}
+*{box-sizing:border-box}
+html,body{margin:0;height:100%;background:var(--bg);color:var(--text);font:14px/1.5 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
+button,input,select{font:inherit;color:inherit}
+button{cursor:pointer;border:1px solid var(--line);background:var(--card);border-radius:8px;padding:6px 12px;transition:.15s}
+button:hover:not(:disabled){border-color:#c7cbd3;background:#fafafa}
+button:disabled{opacity:.45;cursor:not-allowed}
+button.primary{background:var(--accent);border-color:var(--accent);color:#fff}
+button.primary:hover:not(:disabled){background:#4338ca;border-color:#4338ca}
+button.ghost{border-color:transparent;background:transparent;color:var(--muted)}
+button.ghost:hover:not(:disabled){background:#eceef2;color:var(--text)}
+button.danger{color:var(--red)}
+button.sm{padding:3px 9px;font-size:12.5px;border-radius:7px}
+input[type=text],input[type=number],select{border:1px solid var(--line);background:#fff;border-radius:8px;padding:6px 9px;min-width:0}
+input:focus,select:focus{outline:2px solid #c7d2fe;border-color:var(--accent)}
+.app{display:grid;grid-template-rows:auto auto 1fr;height:100vh}
+
+/* header */
+header{display:flex;align-items:center;gap:14px;padding:12px 22px;background:var(--card);border-bottom:1px solid var(--line)}
+.brand{display:flex;align-items:center;gap:9px;font-weight:700;font-size:15.5px}
+.brand i{width:22px;height:22px;border-radius:6px;background:linear-gradient(135deg,#6366f1,#a855f7);display:inline-block}
+.status{display:flex;align-items:center;gap:8px;font-size:13px;color:var(--muted);padding:4px 12px;border-radius:999px;background:var(--bg)}
+.dot{width:8px;height:8px;border-radius:50%;background:var(--faint);flex:none}
+.dot.ok{background:var(--green)} .dot.bad{background:var(--red)} .dot.warn{background:var(--amber)}
+.grow{flex:1}
+.menu{position:relative}
+.pop{position:absolute;right:0;top:40px;background:var(--card);border:1px solid var(--line);border-radius:12px;box-shadow:0 12px 32px #0000001a;padding:14px;width:270px;display:none;z-index:20}
+.pop.on{display:block}
+.pop label{display:flex;justify-content:space-between;align-items:center;font-size:13px;color:var(--muted);margin:6px 0}
+.pop hr{border:none;border-top:1px solid var(--line);margin:12px 0}
+
+/* nodes strip */
+.nodes{padding:18px 22px 6px}
+.nodes-head{display:flex;align-items:baseline;gap:10px;margin-bottom:12px}
+h2{margin:0;font-size:15px;font-weight:650}
+.sub{color:var(--muted);font-size:13px}
+.strip{display:flex;gap:12px;overflow-x:auto;padding-bottom:12px}
+.node{flex:none;width:184px;background:var(--card);border:1px solid var(--line);border-radius:var(--radius);padding:12px 14px;cursor:pointer;transition:.15s;position:relative}
+.node:hover{border-color:#c7cbd3}
+.node.sel{border-color:var(--accent);box-shadow:0 0 0 3px var(--accent-soft)}
+.node.off{background:#fafafa}
+.node .t{display:flex;align-items:center;gap:8px;font-weight:650}
+.node .role{font-size:12.5px;color:var(--muted);margin-top:2px}
+.node .role b{font-weight:600}
+.node .meta{font:12px var(--mono);color:var(--faint);margin-top:8px}
+.node .acts{display:flex;gap:4px;margin-top:10px}
+.node .lag{position:absolute;top:12px;right:12px;font-size:11px;color:var(--amber)}
+.LEADING .dot{background:var(--gold);box-shadow:0 0 0 3px #fef3c7}
+.FOLLOWING .dot{background:var(--green)}
+.LOOKING .dot{background:var(--amber);animation:blink 1s infinite}
+.STOPPED .dot{background:#d1d5db}
+@keyframes blink{50%{opacity:.3}}
+.add{flex:none;width:184px;border:1.5px dashed #cfd3da;border-radius:var(--radius);background:transparent;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:2px;color:var(--muted);padding:14px}
+.add:hover:not(:disabled){border-color:var(--accent);color:var(--accent);background:var(--accent-soft)}
+.add .plus{font-size:24px;line-height:1}
+.add small{font-size:11.5px;color:var(--faint);text-align:center}
+.empty-hero{flex:1;min-width:320px;background:var(--card);border:1px solid var(--line);border-radius:var(--radius);padding:16px 20px;display:flex;align-items:center;gap:18px}
+.empty-hero p{margin:2px 0 0;color:var(--muted);font-size:13px}
+.empty-hero .btns{display:flex;gap:8px;margin-left:auto}
+
+/* work area */
+.work{display:grid;grid-template-columns:400px minmax(0,1fr);gap:16px;padding:6px 22px 18px;min-height:0}
+.card{background:var(--card);border:1px solid var(--line);border-radius:var(--radius);min-height:0;display:flex;flex-direction:column}
+.ops{overflow:auto}
+.ops-head{padding:14px 16px 6px}
+.notice{margin:8px 16px 4px;padding:9px 12px;border-radius:9px;font-size:13px;background:var(--amber-soft);color:#92400e}
+.notice.run{background:var(--accent-soft);color:#3730a3;display:flex;align-items:center;gap:8px}
+.notice.done{background:var(--green-soft);color:#166534}
+.group{padding:4px 8px 8px}
+.group h3{margin:12px 8px 4px;font-size:11.5px;text-transform:uppercase;letter-spacing:.8px;color:var(--faint);font-weight:600}
+.op{border-radius:9px}
+.op-row{display:flex;align-items:center;gap:11px;padding:8px 8px;border-radius:9px;cursor:pointer}
+.op-row:hover{background:var(--bg)}
+.op.open .op-row{background:var(--bg)}
+.op .ic{width:30px;height:30px;border-radius:8px;background:var(--bg);display:grid;place-items:center;font-size:15px;flex:none}
+.op.open .ic{background:var(--accent-soft)}
+.op .tt{font-weight:550;font-size:13.5px}
+.op .dd{color:var(--muted);font-size:12.5px}
+.op .chev{margin-left:auto;color:var(--faint);transition:.15s}
+.op.open .chev{transform:rotate(90deg)}
+.op-body{display:none;padding:6px 10px 14px 49px}
+.op.open .op-body{display:block}
+.fields{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+.fields .full{grid-column:1/-1}
+.fields label.cb{display:flex;align-items:center;gap:6px;font-size:13px;color:var(--muted)}
+.explain{color:var(--muted);font-size:12.5px;margin:10px 0}
+.res{margin-top:8px;font:12.5px var(--mono);padding:7px 10px;border-radius:8px;word-break:break-word}
+.res.ok{background:var(--green-soft);color:#166534}.res.bad{background:var(--red-soft);color:#991b1b}
+.procs{padding:4px 16px 16px}
+.proc{display:flex;align-items:center;gap:9px;padding:7px 0;border-top:1px solid var(--line2);font-size:13px}
+.proc:first-child{border-top:none}
+.proc .nm{font-weight:550}
+.proc .ds{color:var(--faint);font:11.5px var(--mono);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:150px}
+.proc .st{font-size:11px;padding:1px 7px;border-radius:999px;background:var(--green-soft);color:#166534}
+.proc .st.crashed{background:var(--red-soft);color:#991b1b}.proc .st.stopped{background:#f3f4f6;color:var(--muted)}.proc .st.reconnecting{background:var(--amber-soft);color:#92400e}
+.proc .acts{margin-left:auto;display:flex;gap:4px}
+
+/* viewer */
+.viewer{overflow:hidden}
+.tabs{display:flex;align-items:center;gap:4px;padding:10px 12px;border-bottom:1px solid var(--line)}
+.tab{border:none;background:transparent;color:var(--muted);padding:6px 12px;border-radius:8px;font-weight:550}
+.tab.on{background:var(--bg);color:var(--text)}
+.tools{display:flex;align-items:center;gap:8px;margin-left:auto}
+.tools input[type=text]{width:190px}
+.toggle{font-size:12.5px;color:var(--muted);display:flex;align-items:center;gap:5px}
+.pane{flex:1;min-height:0;display:none}
+.pane.on{display:flex;flex-direction:column}
+.term{flex:1;overflow:auto;background:#0f1117;color:#d1d5db;font:12.5px/1.55 var(--mono);padding:10px 0 40px;border-radius:0 0 var(--radius) var(--radius)}
+.ln{padding:0 14px;white-space:pre-wrap;word-break:break-word}
+.ln:hover{background:#171a22}
+.ln .ts{color:#4b5563}
+.ln .lv{display:inline-block;width:48px;font-weight:600}
+.lv.TRACE{color:#4b5563}.lv.DEBUG{color:#9ca3af}.lv.INFO{color:#34d399}.lv.WARN{color:#fbbf24}.lv.ERROR{color:#f87171}
+.ln .cp{display:inline-block;min-width:122px;font-weight:600}
+.ln.WARN .m{color:#fde68a}.ln.ERROR .m{color:#fecaca}.ln.TRACE .m{color:#6b7280}
+.ln .m.star{color:#fff;font-weight:600}
+.ln .kv{color:#6b7280}.ln .kv i{font-style:normal;color:#a5b4fc}
+.nb{margin:12px 14px;padding:10px 14px;border-radius:10px;background:#1e1b4b;color:#e0e7ff;font-family:system-ui,sans-serif}
+.nb b{display:block;margin-bottom:2px}
+.nb div{font-size:12.5px;color:#c7d2fe}
+.ns{margin:8px 14px;padding:6px 12px;border-left:3px solid #818cf8;color:#c7d2fe;font-family:system-ui,sans-serif;font-weight:550;font-size:13px}
+.nr{padding:1px 28px;font-family:system-ui,sans-serif;font-weight:600}
+.nr.ok{color:#4ade80}.nr.bad{color:#f87171}
+.raw{padding:0 14px;color:#9ca3af;white-space:pre}
+.blank{color:#6b7280;text-align:center;padding:40px;font-family:system-ui,sans-serif}
+
+/* tree */
+.tree-wrap{flex:1;display:grid;grid-template-columns:minmax(0,1fr) 300px;min-height:0}
+.tree{overflow:auto;padding:10px 8px;font:13px/1.75 var(--mono)}
+.tn{display:flex;align-items:center;gap:7px;padding:0 8px;border-radius:6px;cursor:pointer;white-space:nowrap}
+.tn:hover{background:var(--bg)}
+.tn.sel{background:var(--accent-soft)}
+.tn .car{width:12px;color:var(--faint);text-align:center;flex:none}
+.tn .seq{color:var(--accent)}
+.tn .e{font:600 10px system-ui;color:#7c3aed;background:#f5f3ff;border-radius:4px;padding:0 5px}
+.tn .v{color:var(--faint);font-size:11.5px}
+.tn .dt{color:var(--muted);overflow:hidden;text-overflow:ellipsis;max-width:240px}
+.tn.new{animation:fg 2.4s}.tn.chg{animation:fb 2.4s}
+@keyframes fg{0%{background:#bbf7d0}100%{background:transparent}}
+@keyframes fb{0%{background:#c7d2fe}100%{background:transparent}}
+.detail{border-left:1px solid var(--line);padding:14px 16px;overflow:auto;font-size:13px}
+.detail h4{margin:0 0 8px;font:600 13px var(--mono);word-break:break-all}
+.kv2{display:grid;grid-template-columns:auto 1fr;gap:3px 12px;color:var(--muted);font-size:12.5px}
+.kv2 b{color:var(--text);font:500 12.5px var(--mono)}
+.detail pre{background:var(--bg);border-radius:8px;padding:8px 10px;font:12px/1.5 var(--mono);white-space:pre-wrap;word-break:break-all;max-height:200px;overflow:auto}
+.pick{display:flex;gap:4px}
+.pick button{padding:3px 10px;font-size:12.5px;border-radius:999px}
+.pick button.on{background:var(--accent);border-color:var(--accent);color:#fff}
+
+/* modal */
+.modal{position:fixed;inset:0;background:#11182766;display:none;align-items:center;justify-content:center;z-index:30}
+.modal.on{display:flex}
+.modal .box{width:min(760px,92vw);max-height:86vh;overflow:auto;background:var(--card);border-radius:16px;padding:24px 28px;box-shadow:0 24px 64px #0003}
+.modal h3{margin:0 0 4px} .modal h4{margin:18px 0 4px;font-size:14px}
+.modal p,.modal li{color:#374151;font-size:13.5px}
+.modal code{background:var(--bg);padding:1px 6px;border-radius:5px;font:12.5px var(--mono)}
+.toast{position:fixed;bottom:20px;left:50%;transform:translateX(-50%) translateY(10px);background:#111827;color:#fff;padding:9px 16px;border-radius:10px;opacity:0;transition:.2s;pointer-events:none;z-index:40;font-size:13px}
+.toast.on{opacity:1;transform:translateX(-50%)}
+.toast.bad{background:#991b1b}
+::-webkit-scrollbar{width:10px;height:10px}::-webkit-scrollbar-thumb{background:#d1d5db;border-radius:8px;border:2px solid transparent;background-clip:padding-box}
+.term::-webkit-scrollbar-thumb{background:#374151}
+</style>
+</head>
+<body>
+<div class="app">
+  <header>
+    <div class="brand"><i></i>ZooKeeper Lab</div>
+    <div class="status" id="status"><span class="dot"></span><span>bağlanıyor…</span></div>
+    <div class="grow"></div>
+    <button class="ghost" id="learnBtn">Nasıl çalışır?</button>
+    <div class="menu">
+      <button class="ghost" id="menuBtn">Ayarlar ▾</button>
+      <div class="pop" id="menu">
+        <label>Node logları
+          <select id="lvlServer"><option>trace</option><option>debug</option><option>info</option><option>warn</option></select></label>
+        <label>Uygulama logları
+          <select id="lvlApp"><option>trace</option><option>debug</option><option>info</option><option>warn</option></select></label>
+        <div class="sub" style="font-size:12px">Node loglarını <b>debug</b> yapınca her yazmanın PROPOSAL → ACK → COMMIT adımlarını görürsün.</div>
+        <hr>
+        <button class="danger" id="resetBtn" style="width:100%">Her şeyi sıfırla</button>
+      </div>
+    </div>
+  </header>
+
+  <section class="nodes">
+    <div class="nodes-head"><h2>Node'lar</h2><span class="sub" id="quorum"></span></div>
+    <div class="strip" id="strip"></div>
+  </section>
+
+  <div class="work">
+    <div class="card ops" id="ops"></div>
+    <div class="card viewer">
+      <div class="tabs">
+        <button class="tab on" data-tab="logs">Loglar</button>
+        <button class="tab" data-tab="tree">Znode ağacı</button>
+        <div class="tools" id="logTools">
+          <select id="src"></select>
+          <select id="minLvl"><option value="0">tüm seviyeler</option><option value="1" selected>debug+</option><option value="2">info+</option><option value="3">uyarılar</option></select>
+          <input type="text" id="q" placeholder="ara…">
+          <label class="toggle"><input type="checkbox" id="follow" checked>takip</label>
+          <button class="ghost sm" id="clear">temizle</button>
+        </div>
+        <div class="tools" id="treeTools" style="display:none">
+          <span class="sub">replika:</span><div class="pick" id="pick"></div>
+        </div>
+      </div>
+      <div class="pane on" id="pane-logs"><div class="term" id="term"></div></div>
+      <div class="pane" id="pane-tree">
+        <div class="tree-wrap">
+          <div class="tree" id="tree"></div>
+          <div class="detail" id="detail"><div class="sub">Detay görmek için bir znode seç.</div></div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="modal" id="learn"><div class="box">
+  <div style="display:flex;align-items:center"><h3>ZooKeeper nasıl çalışır?</h3><span class="grow"></span><button class="ghost" id="learnClose">Kapat</button></div>
+  <h4>Node'lar ve çoğunluk</h4>
+  <p>Cluster'daki node'ların çoğunluğu (3'te 2, 5'te 3) ayakta olduğu sürece hizmet verir. Node'lardan biri <b>lider</b>dir; tüm yazmalar ondan geçer. Diğerleri <b>takipçi</b>dir. Lider ölürse kalanlar yeni bir lider seçer ve <b>epoch</b> bir artar.</p>
+  <h4>Znode'lar</h4>
+  <ul>
+    <li><b>Normal</b> znode, silinene kadar kalır. <b>Ephemeral</b> (<span style="color:#7c3aed">E</span>) znode, onu yaratan istemcinin oturumu bitince kendiliğinden silinir.</li>
+    <li><b>Sequential</b> znode'un adına artan bir sayaç eklenir (<code>lock-0000000003</code>).</li>
+    <li>Her znode'un bir <b>sürümü</b> vardır. Güncellemede sürüm verirsen, değer arada değişmişse işlem <code>BadVersion</code> ile reddedilir.</li>
+  </ul>
+  <h4>Bir yazma nasıl ilerler?</h4>
+  <p>İstemci → bağlı olduğu node → lider: lider isteği bir işleme çevirir ve <code>PROPOSAL</code> olarak gönderir. Takipçiler işlemi diske yazıp <code>ACK</code> döner. Çoğunluk tamamlanınca lider <code>COMMIT</code> eder ve her node işlemi kendi ağacına uygular. Her işlemin bir <code>zxid</code>'i vardır: <code>2:15</code> = 2. epoch'un 15. işlemi.</p>
+  <h4>Okumalar ve watch'lar</h4>
+  <p>Okumalar istemcinin bağlı olduğu node'un kopyasından yapılır. Ağaç sekmesinde node değiştirerek kopyaları karşılaştırabilirsin. Watch, okuma sırasında kurulur ve değişiklikte <b>bir kez</b> tetiklenir.</p>
+  <h4>Denemeye değer</h4>
+  <ul>
+    <li>3 node başlat, lideri çökert: diğer ikisi yeni lider seçer.</li>
+    <li>Sonra bir node daha durdur: çoğunluk kalmadığı için cluster hizmeti durdurur. Bir node'u geri başlatınca düzelir.</li>
+    <li>İki scheduler başlat, liderini <b>çökert</b>: yaklaşık 3 sn sonra diğeri devralır. <b>Durdur</b>'u denersen devir anında olur.</li>
+  </ul>
+</div></div>
+<div class="toast" id="toast"></div>
+
+<script>
+"use strict";
+const $ = s => document.querySelector(s);
+const h = (tag, cls, txt) => { const e = document.createElement(tag); if (cls) e.className = cls; if (txt != null) e.textContent = txt; return e; };
+function toast(msg, bad){ const t = $("#toast"); t.textContent = msg; t.className = "toast on" + (bad ? " bad" : ""); clearTimeout(t._t); t._t = setTimeout(() => t.className = "toast", 2800); }
+async function post(url, body){
+  try { const r = await fetch(url, {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify(body || {})}); return await r.json(); }
+  catch (e) { return {ok:false, error:String(e)}; }
+}
+const NODE_COLORS = ["#2563eb","#9333ea","#ea580c","#059669","#db2777","#ca8a04","#0891b2"];
+const nodeColor = id => NODE_COLORS[(id - 1) % NODE_COLORS.length];
+function compColor(c){
+  const m = /^server-(\d+)/.exec(c); if (m) return ["#60a5fa","#c084fc","#fb923c","#34d399","#f472b6","#facc15","#22d3ee"][(m[1]-1)%7];
+  let x = 0; for (const ch of c.split("/")[0]) x = (x * 31 + ch.charCodeAt(0)) >>> 0; return `hsl(${x % 360} 65% 72%)`;
+}
+const ROLE = {LEADING:"Lider", FOLLOWING:"Takipçi", LOOKING:"Lider arıyor", STOPPED:"Durdu"};
+
+/* ---------------------------------------------------------------- state */
+let ST = null, selNode = 0;
+function renderState(st){
+  ST = st;
+  // header status
+  const s = $("#status"), dot = s.firstChild, txt = s.lastChild;
+  if (!st.size){ dot.className = "dot"; txt.textContent = "henüz node yok"; }
+  else if (st.leader){ dot.className = "dot ok"; txt.textContent = `hizmette · lider Node ${st.leader}`; }
+  else if (st.running >= st.quorum){ dot.className = "dot warn"; txt.textContent = "lider seçiliyor…"; }
+  else { dot.className = "dot bad"; txt.textContent = "çoğunluk yok — hizmet durdu"; }
+  $("#quorum").textContent = st.size ? `${st.running}/${st.size} çalışıyor · çoğunluk için ${st.quorum} gerekli` : "";
+  if (document.activeElement !== $("#lvlServer")) $("#lvlServer").value = st.levels.server;
+  if (document.activeElement !== $("#lvlApp")) $("#lvlApp").value = st.levels.app;
+  if (!st.nodes.find(n => n.id === selNode)) selNode = st.nodes.find(n => n.running)?.id || st.nodes[0]?.id || 0;
+  renderNodes(st); renderNotice(st); renderProcs(st); renderSources(st); renderPick(st);
+}
+
+let lastNodes = "";
+function renderNodes(st){
+  const key = JSON.stringify([st.nodes, st.busy, selNode, st.leader]);
+  if (key === lastNodes) return; lastNodes = key;
+  const strip = $("#strip"); strip.textContent = "";
+  const leader = st.nodes.find(n => n.id === st.leader);
+  for (const n of st.nodes){
+    const c = h("div", "node " + n.state + (n.running ? "" : " off") + (n.id === selNode ? " sel" : ""));
+    const t = h("div", "t"); t.append(h("span", "dot"), h("span", null, "Node " + n.id)); c.append(t);
+    const r = h("div", "role"); r.append(h("b", null, ROLE[n.state] || n.state));
+    if (n.running) r.append(` · epoch ${n.epoch}`); c.append(r);
+    c.append(h("div", "meta", n.running ? `zxid ${n.lastApplied} · ${n.znodes} znode` : "depolaması duruyor"));
+    if (n.running && leader && n.id !== leader.id && n.digest !== leader.digest){ const lg = h("span", "lag", "senkronize oluyor"); c.append(lg); }
+    const a = h("div", "acts");
+    if (n.running) a.append(btn("Durdur", "sm", () => nodeOp("stop", n.id), "node'u çökert (depolaması kalır)"));
+    else a.append(btn("Başlat", "sm", () => nodeOp("start", n.id)));
+    a.append(btn("Kaldır", "sm ghost", () => { if (confirm(`Node ${n.id} cluster'dan kaldırılsın mı? Diğer node'lar yeni konfigürasyonla yeniden başlar.`)) nodeOp("remove", n.id); }));
+    c.append(a);
+    c.onclick = e => { if (e.target.tagName !== "BUTTON"){ selNode = n.id; lastNodes = ""; renderNodes(st); renderPick(st, true); loadTree(true); } };
+    strip.append(c);
+  }
+  if (!st.size){
+    const e = h("div", "empty-hero");
+    const t = h("div"); t.append(h("b", null, "Cluster'ın boş"), h("p", null, "Node'ları sen başlat. 1 node tek başına çalışır; 3 node bir node'un çökmesine dayanır (çoğunluk 2)."));
+    const b = h("div", "btns");
+    b.append(btn("1 node", "", () => nodeOp("add", 0, 1)), btn("3 node'luk cluster", "primary", () => nodeOp("add", 0, 3)), btn("5 node", "", () => nodeOp("add", 0, 5)));
+    e.append(t, b); strip.append(e);
+  } else {
+    const add = h("button", "add"); add.disabled = !!st.busy || st.size >= 7;
+    add.append(h("span", "plus", st.busy ? "…" : "+"), h("span", null, st.busy || "Node ekle"), h("small", null, "üyelik statik: çalışanlar yeniden başlar"));
+    add.onclick = () => nodeOp("add", 0, 1);
+    strip.append(add);
+  }
+}
+function btn(label, cls, fn, title){ const b = h("button", cls, label); b.onclick = e => { e.stopPropagation(); fn(); }; if (title) b.title = title; return b; }
+async function nodeOp(action, id, count){
+  const j = await post("/api/nodes", {action, id, count});
+  if (!j.ok) toast(j.error, true);
+  else toast({add:"node eklendi", stop:`Node ${id} durduruldu`, start:`Node ${id} başlatıldı`, remove:`Node ${id} kaldırıldı`, reset:"sıfırlandı", "crash-leader":j.result}[action] || "tamam");
+}
+
+/* ---------------------------------------------------------------- operations */
+const F = (name, label, type = "text", extra = {}) => ({name, label, type, ...extra});
+const OPS = [
+  {group:"Veri — znode işlemleri", items:[
+    {id:"create", ic:"＋", t:"Znode oluştur", d:"yeni bir veri düğümü ekle",
+     fields:[F("path","/yol","text",{value:"/demo",full:true}), F("data","veri"), F("_",""), F("ephemeral","ephemeral","checkbox"), F("sequential","sequential","checkbox")],
+     ex:"Yazma lidere gider: PROPOSAL → çoğunluk ACK → COMMIT → her node ağacına uygular. Ephemeral seçersen düğüm, oturumun bitince silinir.",
+     run: v => post("/api/znode", {op:"create", ...v})},
+    {id:"get", ic:"👁", t:"Oku", d:"veriyi ve sürümü getir", fields:[F("path","/yol","text",{value:"/demo",full:true})],
+     ex:"Okuma bağlı olunan node'un kendi kopyasından yapılır (burada önce sync çağrılır, böylece en güncel değeri görürsün).",
+     run: v => post("/api/znode", {op:"get", ...v})},
+    {id:"set", ic:"✎", t:"Güncelle", d:"veriyi değiştir (koşullu olabilir)",
+     fields:[F("path","/yol","text",{value:"/demo",full:true}), F("data","yeni veri"), F("version","sürüm (boş = koşulsuz)","number")],
+     ex:"Sürüm verirsen ve düğüm arada değişmişse BadVersion alırsın. Böylece eşzamanlı yazmalar birbirini ezmez.",
+     run: v => post("/api/znode", {op:"set", ...v})},
+    {id:"delete", ic:"🗑", t:"Sil", d:"bir znode'u kaldır", fields:[F("path","/yol","text",{value:"/demo",full:true}), F("version","sürüm (boş = koşulsuz)","number")],
+     ex:"Çocuğu olan bir düğüm silinemez (NotEmpty).", run: v => post("/api/znode", {op:"delete", ...v})},
+    {id:"ls", ic:"☰", t:"Çocukları listele", d:"bir düğümün altını gör", fields:[F("path","/yol","text",{value:"/",full:true})],
+     ex:"", run: v => post("/api/znode", {op:"ls", ...v})},
+    {id:"watch", ic:"🔔", t:"Watch kur", d:"değişince haber al", fields:[F("path","/yol","text",{value:"/demo",full:true})],
+     ex:"Watch tek seferliktir: düğüm oluşturulunca, değişince ya da silinince loglarda “WATCH FIRED” görürsün. Sonra yeniden kurman gerekir.",
+     run: v => post("/api/znode", {op:"watch", ...v})},
+  ]},
+  {group:"Uygulamalar — ZooKeeper'ı kullanan süreçler", items:[
+    {id:"service", ic:"🌐", t:"Servis başlat", d:"HTTP servisi /services/api altına kaydolur",
+     ex:"Servis, ephemeral + sequential bir znode ile kaydolur. Çökerse oturumu bitince kaydı kendiliğinden silinir.", run:() => spawn("service")},
+    {id:"gateway", ic:"🔀", t:"Gateway başlat", d:"canlı servislere yük dağıtır",
+     ex:"Gateway /services/api'yi watch eder ve canlı servisler arasında round-robin istek gönderir. Önce birkaç servis başlat.", run:() => spawn("gateway")},
+    {id:"scheduler", ic:"👑", t:"Scheduler başlat", d:"lider seçimine katılır",
+     ex:"En düşük sıra numaralı scheduler lider olur ve işleri yalnızca o çalıştırır. Diğerleri sadece kendinden bir öncekini izler.", run:() => spawn("scheduler")},
+    {id:"config-service", ic:"⚙", t:"Config servisi başlat", d:"ayarları canlı uygular",
+     ex:"/apps/shop/config düğümünü izler. Aşağıdaki “Config yaz” ile değiştirince servis yeniden başlatılmadan yeni ayarı uygular.", run:() => spawn("config-service")},
+    {id:"config-set", ic:"✎", t:"Config yaz", d:"bir ayarı değiştir", fields:[F("key","anahtar","text",{value:"rateLimit"}), F("value","değer","text",{value:"50"})],
+     ex:"Sürüme bağlı koşullu yazma kullanılır; eşzamanlı bir değişiklik olursa yeniden denenir.", run: v => post("/api/action", {kind:"config-set", ...v})},
+    {id:"worker", ic:"🔧", t:"Worker başlat", d:"kuyruktan iş alır",
+     ex:"Worker bir işi ephemeral bir “claim” düğümüyle sahiplenir. Çökerse claim silinir ve iş başka bir worker'a geçer.", run:() => spawn("worker")},
+    {id:"produce", ic:"📥", t:"Kuyruğa iş ekle", d:"sequential iş düğümleri", fields:[F("count","adet","number",{value:5})],
+     ex:"", run: v => post("/api/action", {kind:"produce", count:+v.count || 1})},
+    {id:"tickets", ic:"🎟", t:"Bilet stoğu", d:"kilitle korunan paylaşılan kaynak", fields:[F("count","stok","number",{value:10})],
+     ex:"Stoğu ayarla ve birkaç bilet ajanı başlat. Ajanlar dağıtık kilit (sırayla, herd etkisi olmadan) altında satış yapar, fazla satış olmaz.",
+     run: v => post("/api/action", {kind:"tickets-init", count:+v.count || 10}),
+     extra:[["Ajan başlat", () => spawn("ticket-agent")], ["Durum", () => post("/api/action", {kind:"tickets-status"})]]},
+  ]},
+  {group:"Arıza deneyleri", items:[
+    {id:"crash-leader", ic:"💥", t:"Lideri çökert", d:"yeni lider seçimini izle",
+     ex:"Takipçiler lideri kaybeder, aralarında seçim yapar; yeni lider yeni bir epoch başlatır. İstemciler başka node'lara taşınır.",
+     run:() => post("/api/nodes", {action:"crash-leader"})},
+    {id:"crash-proc", ic:"⚡", t:"Bir süreci çökert / durdur", d:"oturum zaman aşımını gör", fields:[F("name","süreç","select",{full:true})],
+     ex:"Çökertilen süreç ZooKeeper'a veda etmez: ephemeral düğümleri oturum süresi (≈3 sn) dolunca silinir. Durdurulan süreç ise oturumunu kapatır, düğümleri hemen silinir.",
+     run: v => post("/api/process", {name:v.name, action:"crash"}),
+     runLabel:"Çökert", extra:[["Durdur", v => post("/api/process", {name:v.name, action:"stop"})]]},
+  ]},
+  {group:"Hazır senaryolar", items:[
+    ...[["config","⚙","Dinamik konfigürasyon","3 servis ayarı canlı alır; iki operatör aynı anda yazar"],
+        ["discovery","🌐","Servis keşfi","servisler kaydolur, biri çöker, gateway uyum sağlar"],
+        ["election","👑","Lider seçimi","scheduler lideri çöker, yedek devralır"],
+        ["lock","🔒","Dağıtık kilit","kilitsiz fazla satış ↔ kilitli doğru satış"],
+        ["queue","📦","İş kuyruğu","worker iş ortasında çöker, iş kaybolmaz"],
+        ["failover","💥","Lider node çöker","uygulamalar çalışırken lider node ölür (≥3 node)"]]
+      .map(([id, ic, t, d]) => ({id:"scn-"+id, ic, t, d, ex:"Senaryo kendi süreçlerini başlatır, adım adım anlatımı loglarda gösterir ve sonda sonuçları kontrol eder.",
+                                  run:() => post("/api/scenario", {name:id}), runLabel:"Senaryoyu çalıştır"})),
+    {id:"scn-all", ic:"▶", t:"Hepsini sırayla çalıştır", d:"6 senaryo, ~2 dakika", ex:"", run:() => post("/api/scenario", {name:"all"}), runLabel:"Başlat"},
+  ]},
+];
+async function spawn(kind){ return post("/api/spawn", {kind}); }
+
+function renderOps(){
+  const box = $("#ops"); box.textContent = "";
+  box.append(h("div", "ops-head")); box.firstChild.append(h("h2", null, "Ne yapmak istersin?"));
+  const notice = h("div"); notice.id = "notice"; box.append(notice);
+  for (const g of OPS){
+    const grp = h("div", "group"); grp.append(h("h3", null, g.group));
+    for (const op of g.items) grp.append(renderOp(op));
+    box.append(grp);
+  }
+  const ph = h("div", "group"); ph.append(h("h3", null, "Çalışan süreçler"));
+  const pl = h("div", "procs"); pl.id = "procs"; ph.append(pl); box.append(ph);
+}
+function renderOp(op){
+  const el = h("div", "op"); el.id = "op-" + op.id;
+  const row = h("div", "op-row");
+  const txt = h("div"); txt.append(h("div", "tt", op.t), h("div", "dd", op.d));
+  row.append(h("div", "ic", op.ic), txt, h("span", "chev", "›"));
+  row.onclick = () => { const open = el.classList.contains("open"); document.querySelectorAll(".op.open").forEach(o => o.classList.remove("open")); if (!open) el.classList.add("open"); };
+  const body = h("div", "op-body"); const inputs = {};
+  if (op.fields?.length){
+    const fs = h("div", "fields");
+    for (const f of op.fields){
+      if (f.name === "_"){ fs.append(h("div")); continue; }
+      let inp;
+      if (f.type === "checkbox"){ const l = h("label", "cb"); inp = h("input"); inp.type = "checkbox"; l.append(inp, f.label); fs.append(l); }
+      else if (f.type === "select"){ inp = h("select"); inp.dataset.procs = "1"; if (f.full) inp.className = "full"; fs.append(inp); }
+      else { inp = h("input"); inp.type = f.type; inp.placeholder = f.label; if (f.value != null) inp.value = f.value; if (f.full) inp.className = "full"; fs.append(inp);
+             inp.addEventListener("keydown", e => { if (e.key === "Enter") run.click(); }); }
+      inputs[f.name] = inp;
+    }
+    body.append(fs);
+  }
+  if (op.ex) body.append(h("div", "explain", op.ex));
+  const acts = h("div"); acts.style.cssText = "display:flex;gap:8px;margin-top:" + (op.ex ? "0" : "10px");
+  const values = () => { const v = {}; for (const [k, i] of Object.entries(inputs)){ if (i.type === "checkbox") v[k] = i.checked; else if (i.type === "number"){ if (i.value !== "") v[k] = +i.value; } else v[k] = i.value; } return v; };
+  const res = h("div"); res.style.display = "none";
+  const show = j => { res.style.display = ""; res.className = "res " + (j.ok ? "ok" : "bad"); res.textContent = j.ok ? "✓ " + (typeof j.result === "string" ? j.result : JSON.stringify(j.result)) : "✗ " + j.error; };
+  const run = h("button", "primary sm", op.runLabel || "Çalıştır");
+  run.onclick = async () => { run.disabled = true; const j = await op.run(values()); run.disabled = false; show(j); if (j.ok) loadTree(true); };
+  acts.append(run);
+  for (const [label, fn] of op.extra || []){ const b = h("button", "sm", label); b.onclick = async () => show(await fn(values())); acts.append(b); }
+  body.append(acts, res); el.append(row, body); return el;
+}
+function renderNotice(st){
+  const n = $("#notice"); if (!n) return;
+  n.className = ""; n.textContent = "";
+  if (st.scenario){
+    n.className = "notice run"; n.append(h("span", null, "⏳ Senaryo çalışıyor: " + st.scenario + " — anlatımı loglarda izle"));
+    const b = h("button", "sm", "Durdur"); b.style.marginLeft = "auto"; b.onclick = () => post("/api/scenario", {action:"stop"}); n.append(b);
+  } else if (!st.size){ n.className = "notice"; n.textContent = "Başlamak için yukarıdan node ekle."; }
+  else if (!st.leader){ n.className = "notice"; n.textContent = st.running < st.quorum ? `Çoğunluk yok (${st.running}/${st.size}): işlemler çalışmaz. Bir node başlat.` : "Lider seçiliyor…"; }
+  else if (st.result){ n.className = "notice done"; n.textContent = "Son senaryo — " + st.result; }
+}
+let lastProcs = "";
+function renderProcs(st){
+  const key = JSON.stringify(st.processes); if (key === lastProcs) return; lastProcs = key;
+  const box = $("#procs"); box.textContent = "";
+  if (!st.processes.length) box.append(h("div", "sub", "Henüz süreç yok — “Uygulamalar” grubundan başlat."));
+  for (const p of st.processes){
+    const r = h("div", "proc");
+    r.append(h("span", "nm", p.name), h("span", "st " + p.status, {running:"çalışıyor", crashed:"çöktü", stopped:"durdu", reconnecting:"bağlanıyor"}[p.status] || p.status));
+    if (p.node) r.append(h("span", "ds", "→ " + p.node));
+    const a = h("div", "acts");
+    if (p.status === "running" || p.status === "reconnecting"){
+      a.append(btn("Durdur", "sm ghost", () => post("/api/process", {name:p.name, action:"stop"})), btn("Çökert", "sm ghost danger", () => post("/api/process", {name:p.name, action:"crash"})));
+    }
+    r.append(a); box.append(r);
+  }
+  const live = st.processes.filter(p => p.status === "running" || p.status === "reconnecting");
+  document.querySelectorAll("select[data-procs]").forEach(sel => {
+    const v = sel.value; sel.textContent = "";
+    if (!live.length){ const o = h("option", null, "çalışan süreç yok"); o.value = ""; sel.append(o); }
+    for (const p of live){ const o = h("option", null, p.name); o.value = p.name; sel.append(o); }
+    if (live.find(p => p.name === v)) sel.value = v;
+  });
+}
+
+/* ---------------------------------------------------------------- logs */
+const LV = {TRACE:0, DEBUG:1, INFO:2, WARN:3, ERROR:4};
+const L = {events:[], max:30000, cap:4000, n:0, src:"all", min:1, q:"", follow:true};
+function renderSources(st){
+  const sel = $("#src"); const want = ["all", ...st.nodes.map(n => "server-" + n.id), "apps"];
+  if (sel.dataset.k === want.join()) return; sel.dataset.k = want.join();
+  sel.textContent = "";
+  for (const v of want){ const o = h("option", null, v === "all" ? "tüm kaynaklar" : v === "apps" ? "uygulamalar" : "Node " + v.slice(7)); o.value = v; sel.append(o); }
+  sel.value = want.includes(L.src) ? L.src : "all"; L.src = sel.value;
+}
+function passes(ev){
+  if (ev.kind === "log"){
+    if (LV[ev.lvl] < L.min) return false;
+    if (L.src === "apps" && ev.comp.startsWith("server-")) return false;
+    if (L.src.startsWith("server-") && ev.comp !== L.src) return false;
+  }
+  if (L.q){ const s = ((ev.comp || "") + " " + ev.msg + " " + (ev.attrs || []).map(a => a.k + "=" + a.v).join(" ") + " " + (ev.lines || []).join(" ")).toLowerCase(); if (!s.includes(L.q)) return false; }
+  return true;
+}
+function line(ev){
+  if (ev.kind === "banner"){ const d = h("div", "nb"); d.append(h("b", null, ev.msg)); for (const l of ev.lines || []) d.append(h("div", null, l)); return d; }
+  if (ev.kind === "step") return h("div", "ns", ev.msg);
+  if (ev.kind === "result") return h("div", "nr " + (ev.ok ? "ok" : "bad"), (ev.ok ? "✓ " : "✗ ") + ev.msg);
+  if (ev.kind === "line") return h("div", "raw", ev.msg);
+  const d = h("div", "ln " + ev.lvl);
+  d.append(h("span", "ts", ev.t.slice(0, 12) + " "), h("span", "lv " + ev.lvl, ev.lvl));
+  const label = ev.comp.replace(/^server-(\d+)/, "node-$1");
+  const c = h("span", "cp", label + " "); c.style.color = compColor(ev.comp); d.append(c);
+  d.append(h("span", "m" + (ev.msg.startsWith("★") ? " star" : ""), ev.msg.replace(/^★ /, "")));
+  for (const a of ev.attrs || []){ const s = h("span", "kv", " " + a.k + "="); s.append(h("i", null, a.v)); d.append(s); }
+  return d;
+}
+function rebuild(){
+  const t = $("#term"); t.textContent = ""; L.n = 0;
+  const pick = [];
+  for (let i = L.events.length - 1; i >= 0 && pick.length < L.cap; i--) if (passes(L.events[i])) pick.push(L.events[i]);
+  const f = document.createDocumentFragment(); for (let i = pick.length - 1; i >= 0; i--) f.append(line(pick[i]));
+  t.append(f); L.n = pick.length;
+  if (!L.n) t.append(h("div", "blank", ST && !ST.size ? "Node eklediğinde loglar burada akmaya başlar." : "Filtreye uyan log yok."));
+  scroll();
+}
+let queue = [], raf = 0;
+function ingest(batch){
+  L.events.push(...batch); if (L.events.length > L.max) L.events.splice(0, L.events.length - L.max);
+  queue.push(...batch); if (!raf) raf = requestAnimationFrame(flush);
+}
+function flush(){
+  raf = 0; const t = $("#term"); const b = queue; queue = [];
+  if (!L.n) t.textContent = "";
+  for (const ev of b) if (passes(ev)){ t.append(line(ev)); if (++L.n > L.cap){ t.firstChild.remove(); L.n--; } }
+  scroll();
+}
+function scroll(){ if (L.follow){ const t = $("#term"); t._auto = true; t.scrollTop = t.scrollHeight; } }
+$("#term").addEventListener("scroll", e => { const t = e.target; if (t._auto){ t._auto = false; return; }
+  const bottom = t.scrollHeight - t.scrollTop - t.clientHeight < 40; if (bottom !== L.follow){ L.follow = bottom; $("#follow").checked = bottom; } });
+$("#src").onchange = e => { L.src = e.target.value; rebuild(); };
+$("#minLvl").onchange = e => { L.min = +e.target.value; rebuild(); };
+let qt; $("#q").oninput = e => { clearTimeout(qt); qt = setTimeout(() => { L.q = e.target.value.trim().toLowerCase(); rebuild(); }, 200); };
+$("#follow").onchange = e => { L.follow = e.target.checked; scroll(); };
+$("#clear").onclick = () => { L.events = []; rebuild(); };
+
+/* ---------------------------------------------------------------- tree */
+const T = {nodes:null, prev:null, zxid:"", node:0, sel:null, closed:new Set()};
+let lastPick = "";
+function renderPick(st, force){
+  const key = JSON.stringify([st.nodes.map(n => [n.id, n.running, n.state]), selNode]);
+  if (key === lastPick && !force) return; lastPick = key;
+  const box = $("#pick"); box.textContent = "";
+  for (const n of st.nodes){
+    const b = h("button", n.id === selNode ? "on" : "", "Node " + n.id + (n.state === "LEADING" ? " 👑" : "") + (n.running ? "" : " ✕"));
+    b.onclick = () => { selNode = n.id; lastNodes = ""; renderNodes(st); renderPick(st, true); loadTree(true); };
+    box.append(b);
+  }
+}
+async function loadTree(force){
+  if (!selNode){ const t = $("#tree"); t.textContent = ""; t.append(h("div", "blank", "Node yok.")); return; }
+  if (force){ T.zxid = ""; if (T.node !== selNode){ T.prev = null; T.nodes = null; } }
+  let j; try { j = await (await fetch("/api/tree?node=" + selNode)).json(); } catch { return; }
+  const box = $("#tree");
+  if (!j.ok){ box.textContent = ""; box.append(h("div", "blank", j.error)); T.zxid = ""; T.nodes = null; return; }
+  const r = j.result;
+  if (r.zxid === T.zxid && T.node === r.node && T.nodes) return;
+  T.prev = T.node === r.node ? T.nodes : null; T.node = r.node; T.zxid = r.zxid;
+  T.nodes = new Map(r.nodes.map(n => [n.path, n])); drawTree();
+}
+const parentOf = p => { const i = p.lastIndexOf("/"); return i <= 0 ? "/" : p.slice(0, i); };
+function drawTree(){
+  const box = $("#tree"), top = box.scrollTop; box.textContent = "";
+  const kids = new Map(); for (const p of T.nodes.keys()) if (p !== "/"){ const q = parentOf(p); if (!kids.has(q)) kids.set(q, []); kids.get(q).push(p); }
+  for (const v of kids.values()) v.sort();
+  const walk = (p, d) => {
+    const n = T.nodes.get(p); const ch = kids.get(p) || []; const closed = T.closed.has(p);
+    const r = h("div", "tn" + (T.sel === p ? " sel" : "")); r.style.paddingLeft = (8 + d * 16) + "px";
+    r.append(h("span", "car", ch.length ? (closed ? "▸" : "▾") : ""));
+    const name = p === "/" ? "/" : p.slice(p.lastIndexOf("/") + 1); const m = /^(.*?)(\d{10})$/.exec(name);
+    const nm = h("span"); if (m){ nm.append(m[1]); nm.append(h("span", "seq", m[2])); } else nm.textContent = name; r.append(nm);
+    if (n.owner){ const e = h("span", "e", "E"); e.title = "ephemeral · oturum " + n.owner; r.append(e); }
+    r.append(h("span", "v", "v" + n.version));
+    if (n.data) r.append(h("span", "dt", n.data.length > 50 ? n.data.slice(0, 50) + "…" : n.data));
+    if (T.prev){ const o = T.prev.get(p); if (!o) r.classList.add("new"); else if (o.mzxid !== n.mzxid || o.cversion !== n.cversion) r.classList.add("chg"); }
+    r.onclick = e => { if (e.target.classList.contains("car")){ closed ? T.closed.delete(p) : T.closed.add(p); } else T.sel = p; drawTree(); };
+    box.append(r);
+    if (!closed) for (const c of ch) walk(c, d + 1);
+  };
+  walk("/", 0); box.scrollTop = top; drawDetail();
+}
+function drawDetail(){
+  const d = $("#detail"); d.textContent = ""; const n = T.sel && T.nodes?.get(T.sel);
+  if (!n){ d.append(h("div", "sub", "Detay görmek için bir znode seç.")); return; }
+  d.append(h("h4", null, n.path));
+  const g = h("div", "kv2"); const kv = (k, v) => { g.append(h("span", null, k), h("b", null, String(v))); };
+  kv("sürüm", n.version); kv("çocuk sürümü", n.cversion); kv("oluşturan zxid", n.czxid); kv("değiştiren zxid", n.mzxid);
+  kv("boyut", n.bytes + " bayt"); kv("çocuk", n.children); kv("tür", n.owner ? "ephemeral (oturum " + n.owner + ")" : "kalıcı"); kv("kopya", "Node " + T.node);
+  d.append(g);
+  if (n.data){ d.append(h("pre", null, n.data)); }
+}
+setInterval(() => { if ($("#pane-tree").classList.contains("on")) loadTree(); }, 1000);
+
+/* ---------------------------------------------------------------- tabs, menu, modal */
+document.querySelectorAll(".tab").forEach(b => b.onclick = () => {
+  document.querySelectorAll(".tab").forEach(x => x.classList.toggle("on", x === b));
+  const tab = b.dataset.tab;
+  $("#pane-logs").classList.toggle("on", tab === "logs"); $("#pane-tree").classList.toggle("on", tab === "tree");
+  $("#logTools").style.display = tab === "logs" ? "" : "none"; $("#treeTools").style.display = tab === "tree" ? "" : "none";
+  if (tab === "tree") loadTree(true); else scroll();
+});
+$("#menuBtn").onclick = e => { e.stopPropagation(); $("#menu").classList.toggle("on"); };
+document.addEventListener("click", e => { if (!e.target.closest(".menu")) $("#menu").classList.remove("on"); });
+$("#lvlServer").onchange = e => post("/api/levels", {server:e.target.value}).then(() => toast("node log seviyesi: " + e.target.value));
+$("#lvlApp").onchange = e => post("/api/levels", {app:e.target.value}).then(() => toast("uygulama log seviyesi: " + e.target.value));
+$("#resetBtn").onclick = () => { if (confirm("Tüm node'lar ve süreçler kapatılıp boş bir cluster'a dönülsün mü?")){ $("#menu").classList.remove("on"); nodeOp("reset"); } };
+$("#learnBtn").onclick = () => $("#learn").classList.add("on");
+$("#learnClose").onclick = () => $("#learn").classList.remove("on");
+$("#learn").onclick = e => { if (e.target.id === "learn") $("#learn").classList.remove("on"); };
+
+/* ---------------------------------------------------------------- stream */
+function connect(){
+  const es = new EventSource("/api/events"); let first = true;
+  es.addEventListener("open", () => { first = true; });
+  es.addEventListener("logs", e => { const b = JSON.parse(e.data) || []; if (first){ first = false; L.events = b.slice(-L.max); queue = []; rebuild(); return; } ingest(b); });
+  es.addEventListener("state", e => renderState(JSON.parse(e.data)));
+  es.onerror = () => { $("#status").firstChild.className = "dot bad"; $("#status").lastChild.textContent = "sunucuya bağlanılamıyor…"; };
+}
+renderOps(); rebuild(); connect();
+</script>
+</body>
+</html>

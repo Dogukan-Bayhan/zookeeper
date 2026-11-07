@@ -23,6 +23,24 @@ const (
 	TxnCloseSession
 )
 
+func (t TxnType) String() string {
+	switch t {
+	case TxnCreate:
+		return "createTXN"
+	case TxnDelete:
+		return "deleteTXN"
+	case TxnSetData:
+		return "setDataTXN"
+	case TxnError:
+		return "errorTXN"
+	case TxnCreateSession:
+		return "createSessionTXN"
+	case TxnCloseSession:
+		return "closeSessionTXN"
+	}
+	return "unknownTXN"
+}
+
 // Txn is a state change agreed upon through atomic broadcast.
 type Txn struct {
 	Zxid int64
