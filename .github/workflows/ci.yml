@@ -1,0 +1,41 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    name: Test (Go ${{ matrix.go }})
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        go: ["1.24"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ matrix.go }}
+      - name: gofmt
+        run: test -z "$(gofmt -l .)" || (gofmt -l . && exit 1)
+      - name: go vet
+        run: go vet ./...
+      - name: Unit, ensemble and scenario tests (race detector)
+        run: go test -race -count=1 -timeout 10m ./...
+
+  docker:
+    name: Docker image
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build image
+        run: docker build -t zookeeper-go .
+      - name: Smoke test the web lab
+        run: |
+          docker run -d --name lab -p 8080:8080 zookeeper-go
+          for i in $(seq 1 30); do curl -fs http://localhost:8080/api/state && break; sleep 1; done
+          curl -fs -X POST http://localhost:8080/api/nodes -d '{"action":"add","count":3}'
+          sleep 2
+          curl -fs -X POST http://localhost:8080/api/znode -d '{"op":"create","path":"/ci","data":"ok"}' | grep '"ok":true'
+          docker logs lab | tail -20

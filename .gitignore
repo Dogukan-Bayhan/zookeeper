@@ -1,0 +1,20 @@
+# binaries
+/zkapp
+/zkserver
+/zkcli
+*.exe
+*.test
+/bin/
+
+# local server data
+/data*/
+
+# tooling
+*.out
+coverage.*
+.idea/
+.vscode/
+.DS_Store
+
+# the paper (link to it instead of redistributing it)
+*.pdf

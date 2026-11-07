@@ -120,6 +120,9 @@ func TestConditionalUpdates(t *testing.T) {
 		}()
 	}
 	wg.Wait()
+	// cl may be connected to a follower that has not applied the last
+	// commits yet: sync first, reads are local (Section 2.3).
+	must(t, cl.Sync("/counter"))
 	data, _, err := cl.GetData("/counter", false)
 	must(t, err)
 	if string(data) != fmt.Sprint(workers*incs) {
